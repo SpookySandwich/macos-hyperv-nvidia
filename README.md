@@ -11,6 +11,12 @@ down, without restarting Windows.
 This is a personal, noncommercial project. It documents what we built and shares the
 patches and scripts; it is not a product or an installer you can run blind.
 
+**Almost all of the hard work here is other people's.** The NVIDIA Metal driver is NullMoth's,
+the Hyper-V support for macOS is Goldfish64's and acidanthera's, the Hyper-V OpenCore setup is
+Qonfused's, and the boot stack is acidanthera's. What this repository adds is incremental: the
+glue that lets the upstream driver drive a GPU passed through to a Hyper-V VM with no monitor,
+a few fixes found along the way, and notes. See [Credits](#credits).
+
 ## Status
 
 What works:
@@ -87,18 +93,54 @@ why: [docs/driver-changes.md](docs/driver-changes.md). Things we learned the har
 
 ## Credits
 
-- [nullmoth/nvidia-macos-driver](https://github.com/nullmoth/nvidia-macos-driver): the NVIDIA
-  Metal driver for macOS that makes any of this possible.
-- [acidanthera/MacHyperVSupport](https://github.com/acidanthera/MacHyperVSupport) (Goldfish64),
-  [Lilu](https://github.com/acidanthera/Lilu), [VirtualSMC](https://github.com/acidanthera/VirtualSMC),
-  [MacKernelSDK](https://github.com/acidanthera/MacKernelSDK) and
-  [OpenCore](https://github.com/acidanthera/OpenCorePkg) by acidanthera.
+This project stands on the following work. Thank you to everyone involved.
+
+**The NVIDIA driver**
+
+- [NullMoth Systems / nvidia-macos-driver](https://github.com/nullmoth/nvidia-macos-driver):
+  the NVIDIA Metal driver for macOS (kernel extensions, Metal plugin, framebuffer, accelerator).
+  Everything GPU-related here is a small set of patches on top of it, and several of our fixes
+  are ports or extensions of theirs.
+- The upstream driver's own foundations:
+  [NVIDIA open-gpu-kernel-modules](https://github.com/NVIDIA/open-gpu-kernel-modules) (r610),
+  [Mesa](https://gitlab.freedesktop.org/mesa/mesa) NVK and the NAK compiler, and
+  [metal2vulkan](https://github.com/steelbrain/metal2vulkan) by Anees Iqbal, on which the
+  shader translator is based.
+- Upstream contributors whose fixes this setup relies on, among them @imbrahiam (#200, keeping
+  a surface's VRAM across page-off), @imyago9 (#147, reporting work as scheduled only after
+  IOSurface writes finish) and the reporters of #65 and #206 (the NVENC encoder status on
+  pre-Blackwell GPUs), plus everyone who filed logs and tested releases.
+
+**macOS on Hyper-V**
+
+- [acidanthera/MacHyperVSupport](https://github.com/acidanthera/MacHyperVSupport) by
+  Goldfish64: Hyper-V VMBus, storage, network, input, PCI passthrough and the synthetic
+  framebuffer for macOS. Our Hyper-V display changes are a patch on top of it.
+- [Qonfused/OSX-Hyper-V](https://github.com/Qonfused/OSX-Hyper-V): the OpenCore configuration
+  and scripts for running macOS on Hyper-V that this VM was built from.
+- [OpenCore](https://github.com/acidanthera/OpenCorePkg), [Lilu](https://github.com/acidanthera/Lilu),
+  [VirtualSMC](https://github.com/acidanthera/VirtualSMC) and
+  [MacKernelSDK](https://github.com/acidanthera/MacKernelSDK) by acidanthera and contributors.
 - [AMFIPass](https://github.com/dhinakg/AMFIPass) by dhinakg.
-- [Qonfused/OSX-Hyper-V](https://github.com/Qonfused/OSX-Hyper-V): the Hyper-V OpenCore base.
-- NVIDIA [open-gpu-kernel-modules](https://github.com/NVIDIA/open-gpu-kernel-modules) and
-  Mesa NVK, used by the upstream driver.
-- The Windows app uses [NAudio](https://github.com/naudio/NAudio); its virtual-desktop
-  interop was checked against [MScholtes/VirtualDesktop](https://github.com/MScholtes/VirtualDesktop).
+
+**References we learned from**
+
+- Apple's open source releases ([apple-oss-distributions](https://github.com/apple-oss-distributions)),
+  in particular IOGraphics and IOPCIFamily, for how macOS framebuffers and PCI devices behave.
+- The Linux Hyper-V PCI driver (`drivers/pci/controller/pci-hyperv.c` in the
+  [Linux kernel](https://github.com/torvalds/linux)), as the reference for the Hyper-V
+  virtual PCI protocol.
+- Microsoft's [Discrete Device Assignment documentation](https://learn.microsoft.com/en-us/windows-server/virtualization/hyper-v/plan/plan-for-deploying-devices-using-discrete-device-assignment).
+- [Sunshine](https://github.com/LizardByte/Sunshine) and
+  [Moonlight](https://github.com/moonlight-stream/moonlight-qt), which we used to evaluate
+  streaming as a display path.
+
+**Windows app**
+
+- [NAudio](https://github.com/naudio/NAudio); the virtual-desktop interop was checked against
+  [MScholtes/VirtualDesktop](https://github.com/MScholtes/VirtualDesktop).
+
+If we missed someone whose work is in here, please open an issue and we will add them.
 
 ## License
 
