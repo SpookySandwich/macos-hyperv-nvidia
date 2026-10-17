@@ -30,10 +30,11 @@ detail show compression, and it adds an encoder in the loop.
 - If you use it anyway: Sunshine's software encoder supports 4:4:4 chroma (enable "YUV 4:4:4"
   in Moonlight), which helps text; stream at the client's exact resolution.
 
-## 3. A monitor on the RTX 4060's HDMI port
+## 3. A monitor on the RTX 4060's own output (likely HDMI)
 
 The laptop's internal panel is wired to the Intel GPU. The RTX 4060 reports one external
-connector, the HDMI port. A monitor on that port would be driven by the GPU directly through
+connector (its type is not reported; on this laptop the internal panel and Thunderbolt ports are on
+the Intel GPU, so it is most likely the HDMI port). A monitor on that port would be driven by the GPU directly through
 upstream's own framebuffer (NVRMFB), which is upstream's normal, supported path and avoids all
 copies. We did not test it in the VM. One known interaction: if NVRMFB publishes a head before
 the Hyper-V console head, the console would become a duplicate without a display pipe.

@@ -28,7 +28,7 @@ Limits:
 - **The display path is laggy.** The RTX 4060 has no monitor here, so every frame is copied
   out of GPU memory into Hyper-V's synthetic framebuffer and then shown through Hyper-V's
   RDP-based console viewer. Rendering is fast; getting pixels to the screen is not.
-- **No direct monitor** unless one is connected to the RTX 4060's HDMI port (untested in the
+- **No direct monitor** unless one is connected to the port wired to the RTX 4060 (likely HDMI; untested in the
   VM). The laptop has no MUX: the internal panel is always on the Intel GPU, and the RTX 4060
   reports a single external connector.
 - **Streaming** with Sunshine and Moonlight was evaluated: smooth, but it looks like video, and
@@ -64,6 +64,11 @@ See [docs/display-options.md](docs/display-options.md) for the display alternati
 4. Apply the OpenCore changes: [docs/opencore.md](docs/opencore.md).
 5. On Windows, fill in `host/machine.json` and use `host/manage-hyperv.ps1 -Action StartSession`
    / `-Action ShutdownAndReturn` (elevated), or build the Windows app in `app/`.
+
+This is a record of one working setup, not a turnkey installer. The patches reproduce the
+drivers that ran in the screenshot; the build and helper scripts were cleaned up and
+parameterized for publication and have not been re-run from this repository since, so expect
+to adapt them.
 
 How it fits together: [docs/architecture.md](docs/architecture.md). What each patch changes and
 why: [docs/driver-changes.md](docs/driver-changes.md). Things we learned the hard way:
