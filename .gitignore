@@ -1,0 +1,43 @@
+# Machine-specific configuration and secrets (never commit)
+host/machine.json
+app/src/machine.json
+*.clixml
+*.pem
+id_*
+sunshine*login*
+
+# Runtime output of the host scripts
+host/result-*.json
+host/worker-*.json
+host/worker-*.txt
+host/gpu-ownership-*.json*
+host/guest-gpu-readiness.json
+host/approve-session.log
+host/normal-boot-*.txt
+host/console.png
+host/console.rgb565
+
+# Disk images and firmware
+*.vhdx
+*.vhd
+*.raw
+*.qcow2
+*.img
+*.iso
+EFI/
+
+# Build output
+bin/
+obj/
+.vs/
+app/publish/
+app/dist/
+app/src/MacOS.App/Interop/*.dll
+app/src/MacOS.App/Guest/
+app/guest/out/
+guest/headless-metal/build/
+plugin-out/
+*.kext/
+*.o
+__pycache__/
+*.log

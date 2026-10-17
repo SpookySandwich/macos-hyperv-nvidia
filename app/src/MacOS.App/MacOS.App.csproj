@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType><AssemblyName>macOS</AssemblyName><RootNamespace>MacOS.App</RootNamespace>
+    <UseWinUI>true</UseWinUI><WindowsPackageType>None</WindowsPackageType>
+    <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained><RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <ApplicationManifest>app.manifest</ApplicationManifest><ApplicationIcon>Assets/macOS.ico</ApplicationIcon>
+    <EnableMsixTooling>true</EnableMsixTooling><PublishReadyToRun>false</PublishReadyToRun>
+  </PropertyGroup>
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.WindowsDesktop.App.WindowsForms"/>
+    <PackageReference Include="Microsoft.WindowsAppSDK" Version="2.5.1"/>
+    <PackageReference Include="NAudio.Wasapi" Version="3.1.0"/>
+    <ProjectReference Include="../MacOS.Core/MacOS.Core.csproj"/>
+    <Reference Include="MSTSCLib"><HintPath>Interop/MSTSCLib.dll</HintPath><EmbedInteropTypes>false</EmbedInteropTypes></Reference>
+    <Reference Include="AxMSTSCLib"><HintPath>Interop/AxMSTSCLib.dll</HintPath><EmbedInteropTypes>false</EmbedInteropTypes></Reference>
+    <Content Update="Assets/macOS.ico" CopyToOutputDirectory="PreserveNewest"/>
+    <Content Include="Guest/macos-bridge" CopyToOutputDirectory="PreserveNewest"/>
+    <Content Include="Guest/macos-display" CopyToOutputDirectory="PreserveNewest"/>
+    <Content Include="Guest/macos-audio.tar.gz" CopyToOutputDirectory="PreserveNewest"/>
+    <Content Include="../../guest/readiness.py" Link="Guest/readiness.py" CopyToOutputDirectory="PreserveNewest"/>
+    <Content Include="THIRD-PARTY-NOTICES.txt" CopyToOutputDirectory="PreserveNewest"/>
+    <Content Include="../machine.json" Link="machine.json" CopyToOutputDirectory="PreserveNewest" Condition="Exists('../machine.json')"/>
+  </ItemGroup>
+</Project>

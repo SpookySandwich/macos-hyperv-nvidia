@@ -1,0 +1,143 @@
+diff -ruN --strip-trailing-cr a/plugin/NVMTLObjects.h b/plugin/NVMTLObjects.h
+--- a/plugin/NVMTLObjects.h
++++ b/plugin/NVMTLObjects.h
+@@ -49,6 +49,7 @@
+   uint64_t _resid;
+   NSUInteger _usage;
+   NVMTLBuffer *_backBuf; NSUInteger _backOff, _backBPR;
++  BOOL _copiedBufferView, _copiedBufferGpuDirty;   // HYPERV: live copy of a buffer region the GPU cannot alias
+ }
+ - (nvk_image *)nvi;
+ - (void *)nvview;
+diff -ruN --strip-trailing-cr a/plugin/NVMTLObjects.m b/plugin/NVMTLObjects.m
+--- a/plugin/NVMTLObjects.m
++++ b/plugin/NVMTLObjects.m
+@@ -769,7 +769,16 @@
+         return nil; }
+     MTLTextureDescriptor *cd = [d copy]; cd.storageMode = MTLStorageModeShared;
+     id<MTLTexture> c = [[self device] newTextureWithDescriptor:cd];
+-    if (c) [c replaceRegion:MTLRegionMake2D(0, 0, d.width, d.height) mipmapLevel:0 withBytes:(char *)base + offset bytesPerRow:bpr];
++    // HYPERV: keep the copy live - re-uploaded from the buffer before each use and
++    // read back after GPU writes - instead of a one-time snapshot that never sees
++    // what the caller draws into the buffer afterwards.
++    if (c) {
++        NVMTLTexture *view = (NVMTLTexture *)c;
++        view->_backBuf = self; view->_backOff = offset; view->_backBPR = bpr;
++        view->_copiedBufferView = YES;
++        _texSeen = YES;
++        [view nvmtlSurfaceIn];
++    }
+     { static int said; if (!said++) nvlog("newTiledTextureWithDescriptor: linear view refused -> copied texture (%lux%lu bpr %lu; said once)",
+                                           (unsigned long)d.width, (unsigned long)d.height, (unsigned long)bpr); }
+     return c;
+@@ -883,7 +892,8 @@
+ static void nvmtl_surf_dirty(NVMTLCommandBuffer *cb, NVMTLTexture *t) {
+     if (!cb || !t) return;
+     NVMTLTexture *r = t->_parent ? t->_parent : t;
+-    if (!r->_surf) return;
++    if (!r->_surf && !r->_copiedBufferView) return;
++    if (r->_copiedBufferView) r->_copiedBufferGpuDirty = YES;
+     if (!cb->_surfDirty) cb->_surfDirty = [NSMutableSet new];
+     [cb->_surfDirty addObject:r];
+ }
+@@ -1025,6 +1035,13 @@
+         if (on && !was) nvlog("G17 EXPERIMENT ON: surface-out writes under a read-only lock, the IOSurface seed does not move");
+         if (!on && was) nvlog("G17 experiment off: surface-out bumps the seed again"); }
+     return on; }
++// HYPERV: GPU-written shared surfaces up to this size are paged back to system
++// memory as soon as their writes are marked (NVMTL_EAGER_SURFACE_KB, default 256;
++// 0 disables), so a small layer that later goes volatile cannot come back as zeros.
++static size_t nvmtl_eager_surface_bytes(void) {
++    static size_t bytes = SIZE_MAX;
++    if (bytes == SIZE_MAX) { const char *e = getenv("NVMTL_EAGER_SURFACE_KB"); bytes = (size_t)(e ? strtoul(e, NULL, 10) : 256) * 1024; }
++    return bytes; }
+ static void nvmtl_census(const char *what, uint32_t w, uint32_t h, int surf) {
+     static struct { const char *what; uint32_t w, h; int surf; } seen[48]; static int n;
+     @synchronized([NSObject class]) {
+@@ -1199,6 +1216,14 @@
+ }
+ - (void)nvmtlSurfaceIn {
+     NVMTLTexture *r = _parent ? _parent : self;
++    if (r->_copiedBufferView) {
++        if (!r->_copiedBufferGpuDirty) {
++            const void *base = [r->_backBuf contents];
++            if (!base || nvmtl_vk_image_write(r->_q, &r->_i, (const char *)base + r->_backOff, r->_backBPR))
++                nvlog("buffer texture: fallback upload FAILED");
++        }
++        return;
++    }
+     if (!r->_surf) return;
+     @synchronized (nvmtl_surface_sync(r)) {
+     const uint32_t vgen = r->_vramOn ? 0 : nvmtl_vram_gen(r->_surf, r->_plane);
+@@ -1224,10 +1249,23 @@
+ }
+ - (BOOL)nvmtlSurfaceOut {
+     NVMTLTexture *r = _parent ? _parent : self;
++    if (r->_copiedBufferView) {
++        void *base = [r->_backBuf contents];
++        if (!base || nvmtl_vk_image_read(r->_q, &r->_i, (char *)base + r->_backOff, r->_backBPR)) {
++            nvlog("buffer texture: fallback readback FAILED"); return NO; }
++        [r->_backBuf didModifyRange:NSMakeRange(r->_backOff, r->_backBPR * r->_i.h)];
++        r->_copiedBufferGpuDirty = NO;
++        return YES;
++    }
+     if (!r->_surf) return YES;
+     @synchronized (nvmtl_surface_sync(r)) {
+     if (![r nvmtlSurfaceCopyable]) return NO;
+     if (r->_vramOn && !nvmtl_vk_surface_dirty((uint32_t)IOSurfaceGetID(r->_surf), (uint32_t)r->_plane)) {
++        // HYPERV: a read-only lock makes the kernel page the VRAM contents back now,
++        // which costs almost nothing for small surfaces.
++        if (IOSurfaceGetAllocSize(r->_surf) <= nvmtl_eager_surface_bytes()
++            && IOSurfaceLock(r->_surf, kIOSurfaceLockReadOnly, NULL) == kIOReturnSuccess)
++            IOSurfaceUnlock(r->_surf, kIOSurfaceLockReadOnly, NULL);
+         uint32_t seed = IOSurfaceGetSeed(r->_surf);
+         r->_surfSeed = seed; r->_surfSynced = YES;
+         r->_surfGen = nvmtl_vram_tag_bump(r->_surf, r->_plane, seed);
+@@ -2671,7 +2709,7 @@
+         if (i) {
+             [cb->_resources addObject:t];
+             NVMTLTexture *sr = t->_parent ? t->_parent : t;
+-            if (sr->_surf) {
++            if (sr->_surf || sr->_copiedBufferView) {
+                 if (ca.loadAction == MTLLoadActionClear) nvmtl_surface_overwrite_recorded(cb, sr);
+                 else nvmtl_surface_in_for_cb(cb, sr);
+                 nvmtl_surf_dirty(cb, sr); }
+@@ -2927,12 +2965,29 @@
+     nvtrace("VERTEX SAMPLER[%lu] pixel=%d bound=%d",(unsigned long)i,ns && ns->_pixelState!=nil,ns!=nil);
+     if(ns) { if (!_cb->_resources) _cb->_resources=[NVMTLResSet new];[_cb->_resources addObject:ns]; }
+ }
++// HYPERV: a draw that samples the pass's own colour target (WindowServer's window rebuilds read the window surface
++// back for materials/vibrancy, after a memoryBarrier) must see what earlier draws in this pass wrote. A pipeline
++// barrier inside the render pass does not guarantee that here, so end the pass, barrier outside it, and resume with
++// everything loaded - the same split the mesh path uses. Without it the read returns stale/zero texels and the draw
++// (blending off) paints opaque black boxes into inactive windows (Notes' "Continue" button, Settings labels).
++- (void)nvmtlSplitForSelfRead {
++    nvmtl_vk_cmd_end_render(&_cb->_c);
++    nvmtl_vk_cmd_barrier(&_cb->_c);
++    if (![self nvmtlBeginPassLoad:NVMTL_LOAD_ALL]) {
++        _begun = NO; nvlog("encoder: render pass could not RESUME after a self-read split - the rest of this encoder is not drawn"); return; }
++    nvmtl_vk_cmd_set_cull(&_cb->_c, _cull);
++    if (_hasVP) nvmtl_vk_cmd_set_viewport(&_cb->_c, _vp[0], _vp[1], _vp[2], _vp[3], _vp[4], _vp[5]);
++    if (_hasSC) nvmtl_vk_cmd_set_scissor(&_cb->_c, (int32_t)_sc[0], (int32_t)_sc[1], _sc[2], _sc[3]);
++    [self nvmtlApplyDepthStencil];
++}
+ - (void)setFragmentTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i {
+     NVMTLTexture *nt = (NVMTLTexture *)t;
+     if (!nt) { nvlog("setFragmentTexture: nil at index %lu", (unsigned long)i); return; }
+     nvmtl_retain_resource(_cb, nt);
+     nvmtl_surface_cpu_dump(nt->_parent ? nt->_parent : nt);
+     nvmtl_surface_in_for_cb(_cb, nt);
++    { NVMTLTexture *rt = nt->_parent ? nt->_parent : nt, *tt = _target ? (_target->_parent ? _target->_parent : _target) : nil;
++      if (_begun && tt && (rt == tt || [rt nvi]->img == [tt nvi]->img)) [self nvmtlSplitForSelfRead]; }
+     { NVMTLTexture *rt = nt->_parent ? nt->_parent : nt; nvtrace("FTEX[%lu] %ux%u surf %u view %d", (unsigned long)i, [nt nvi]->w, [nt nvi]->h,
+         rt->_surf ? (unsigned)IOSurfaceGetID(rt->_surf) : 0u, nt->_parent != nil); }
+     if (nt->_tbView) nvmtl_vk_bind_texel_view(&_cb->_c, NVMTL_SET_FRAGMENT, (uint32_t)i, nt->_tbView, nt->_tbStorage);
+@@ -4778,7 +4833,7 @@
+             sr->_surf ? (unsigned)IOSurfaceGetID(sr->_surf) : 0u, e->_target->_parent != nil, (unsigned long)d.colorAttachments[0].loadAction,
+             (unsigned long)d.colorAttachments[0].storeAction, d.colorAttachments[0].clearColor.red, d.colorAttachments[0].clearColor.green,
+             d.colorAttachments[0].clearColor.blue, d.colorAttachments[0].clearColor.alpha, d.depthAttachment.texture != nil);
+-        if (sr->_surf) {
++        if (sr->_surf || sr->_copiedBufferView) {
+             if (d.colorAttachments[0].loadAction == MTLLoadActionClear) nvmtl_surface_overwrite_recorded(self, sr);
+             else nvmtl_surface_in_for_cb(self, sr);
+             nvmtl_surf_dirty(self, sr); } }

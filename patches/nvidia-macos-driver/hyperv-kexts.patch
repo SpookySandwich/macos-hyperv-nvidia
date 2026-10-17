@@ -1,0 +1,2562 @@
+diff --git a/build/hyperv_build.sh b/build/hyperv_build.sh
+new file mode 100644
+index 0000000..e1db51f
+--- /dev/null
++++ b/build/hyperv_build.sh
+@@ -0,0 +1,60 @@
++#!/bin/bash
++# hyperv_build.sh [<src> [<out>]]: build the Hyper-V carry of NVAccel (macOS 15) and NVRMAGDC from this tree, in the
++# macOS guest, with the same toolchain the deployed NVAccel 0.2.0 used (Xcode clang, MacHyperVSupport's MacKernelSDK,
++# open-gpu-kernel-modules 610.57.04 headers). NVRM.kext and NVRMFB.kext are NOT built: they come from the 2.3.1 release.
++#   <src>  the directory holding kexts/ and build/ (default: this script's parent)
++#   <out>  output directory (default: ~/hyperv-build/rebase-2.3.1-out)
++# Environment: HYPERV_BUILD_ROOT (default ~/hyperv-build), MACKERNELSDK, OGKM override the two header trees.
++set -euo pipefail
++HERE=$(cd "$(dirname "$0")" && pwd)
++SRC=$(cd "${1:-$HERE/..}" && pwd)
++ROOT=${HYPERV_BUILD_ROOT:-$HOME/hyperv-build}
++OUT=${2:-$ROOT/rebase-2.3.1-out}
++SDK=${MACKERNELSDK:-$ROOT/MacHyperVSupport/MacKernelSDK}
++OGKM=${OGKM:-$ROOT/ogkm610}
++NV=$OGKM/src/nvidia; KMS=$OGKM/src/nvidia-modeset
++VERSION=2.3.1d1   # CFBundleVersion; CFBundleShortVersionString is 2.3.1-hv1
++
++for d in "$SDK/Headers" "$KMS/kapi/interface" "$SRC/kexts/NVRM/accel/hyperv" "$SRC/kexts/NVRMAGDC"; do
++    [ -d "$d" ] || { echo "STOP: missing $d" >&2; exit 1; }
++done
++if git -C "$OGKM" rev-parse >/dev/null 2>&1; then
++    tag=$(git -C "$OGKM" describe --tags --exact-match 2>/dev/null || true)
++    [ "$tag" = 610.57.04 ] || { echo "STOP: $OGKM is at '${tag:-untagged}', NVRM 2.3.1 is built against 610.57.04" >&2; exit 1; }
++fi
++grep -q '^#define NVRM_VRAM_ABI_VERSION 2u' "$SRC/kexts/NVRM/nvrm_vram_abi.h" || { echo "STOP: VRAM ABI is not version 2" >&2; exit 1; }
++
++rm -rf "$OUT"; mkdir -p "$OUT/NVAccel.kext/Contents/MacOS" "$OUT/NVRMAGDC.kext/Contents/MacOS"
++FLAGS=(-target x86_64-apple-macos12.0 -isysroot "$SDK" -fapple-kext -mkernel -nostdinc
++       -DKERNEL -DKERNEL_PRIVATE -DDRIVER_PRIVATE -DAPPLE -DNeXT -std=c++17 -fno-rtti -fno-exceptions -fno-builtin
++       -fno-common -mno-red-zone -O2 -Wno-inconsistent-missing-override -Wno-deprecated-declarations -Wno-invalid-offsetof
++       -I "$SDK/Headers")
++A=$SRC/kexts/NVRM
++ACCEL_INC=(-I "$A" -I "$A/accel" -I "$A/accel/iofam" -I "$A/accel/re"
++    -I "$NV/arch/nvalloc/unix/include" -I "$NV/arch/nvalloc/common/inc"
++    -I "$OGKM/src/common/sdk/nvidia/inc" -I "$OGKM/src/common/sdk/nvidia/inc/hw"
++    -I "$OGKM/src/common/inc" -I "$OGKM/src/common/shared/inc" -I "$NV/inc" -I "$NV/interface"
++    -I "$KMS/os-interface/include" -I "$KMS/kapi/interface" -I "$KMS/kapi/include"
++    -I "$OGKM/src/common/unix/nvidia-push/interface" -I "$KMS/interface" -I "$KMS/include"
++    -I "$OGKM/src/common/unix/common/inc" -I "$OGKM/src/common/modeset"
++    -I "$OGKM/src/common/unix/common/utils/interface")
++
++echo "== NVAccel (macOS 15)"
++xcrun clang++ "${FLAGS[@]}" "${ACCEL_INC[@]}" -c "$A/accel/nvrm-accel.cpp" -o "$OUT/nvrm-accel.o"
++xcrun ld -arch x86_64 -kext -static -undefined dynamic_lookup -o "$OUT/NVAccel.kext/Contents/MacOS/NVAccel" "$OUT/nvrm-accel.o"
++cp "$A/accel/Info.plist" "$OUT/NVAccel.kext/Contents/Info.plist"
++
++echo "== NVRMAGDC"
++xcrun clang++ "${FLAGS[@]}" -I "$SRC/kexts/NVRMAGDC" -c "$SRC/kexts/NVRMAGDC/nvrm-agdc.cpp" -o "$OUT/nvrm-agdc.o"
++xcrun ld -arch x86_64 -kext -static -undefined dynamic_lookup -o "$OUT/NVRMAGDC.kext/Contents/MacOS/NVRMAGDC" "$OUT/nvrm-agdc.o"
++cp "$SRC/kexts/NVRMAGDC/Info.plist" "$OUT/NVRMAGDC.kext/Contents/Info.plist"
++
++for k in NVAccel NVRMAGDC; do
++    plutil -lint "$OUT/$k.kext/Contents/Info.plist" >/dev/null
++    [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$OUT/$k.kext/Contents/Info.plist")" = "$VERSION" ] ||
++        { echo "STOP: $k Info.plist is not version $VERSION" >&2; exit 1; }
++    codesign --force --sign - "$OUT/$k.kext"
++    echo "$k $VERSION $(shasum -a 256 "$OUT/$k.kext/Contents/MacOS/$k" | cut -d' ' -f1) $(dwarfdump --uuid "$OUT/$k.kext/Contents/MacOS/$k" | awk '{print $2}')"
++done
++rm -f "$OUT"/*.o
++echo "HYPERV_BUILD_PASS $OUT"
+diff --git a/kexts/NVRM/accel/Info.plist b/kexts/NVRM/accel/Info.plist
+index 93c5127..ac3c6c6 100644
+--- a/kexts/NVRM/accel/Info.plist
++++ b/kexts/NVRM/accel/Info.plist
+@@ -8,8 +8,8 @@
+ 	<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+ 	<key>CFBundleName</key><string>NVAccel</string>
+ 	<key>CFBundlePackageType</key><string>KEXT</string>
+-	<key>CFBundleShortVersionString</key><string>0.1</string>
+-	<key>CFBundleVersion</key><string>0.1</string>
++	<key>CFBundleShortVersionString</key><string>2.3.1-hv1</string>
++	<key>CFBundleVersion</key><string>2.3.1d1</string>
+ 	<key>OSBundleLibraries</key>
+ 	<dict>
+ 		<key>com.apple.iokit.IOAcceleratorFamily2</key><string>2.0.0</string>
+diff --git a/kexts/NVRM/accel/NvCompletedStaging.hpp b/kexts/NVRM/accel/NvCompletedStaging.hpp
+new file mode 100644
+index 0000000..67131d8
+--- /dev/null
++++ b/kexts/NVRM/accel/NvCompletedStaging.hpp
+@@ -0,0 +1,71 @@
++#pragma once
++#include <IOKit/IOTypes.h>
++class NVAccel;
++class NVVidMemory;
++class IOService;
++class IOMemoryDescriptor;
++class IOMemoryMap;
++
++enum class NvSConsumerResult : UInt32 {
++    PixelsEstablished = 1, StaleRejected = 2, ConsumerFailure = 3
++};
++enum class NvSProviderResult : UInt32 {
++    PixelsEstablished = 1, StaleRejected = 2, ConsumerFailure = 3,
++    NotReady = 4, InvalidSource = 5, DmaFailure = 6, Cancelled = 7,
++    LeaseExhausted = 8
++};
++struct NvSCompletedView {
++    const void *cpuAddress;
++    UInt64 validLength;
++    UInt32 width, height, pitch, reserved;
++    UInt64 leaseIdentity;             // never zero; no wrap/reuse in this boot
++    UInt64 sourceIdentity;            // actual NVVidMemory allocation cookie
++    const void *sourceRmHandle;       // identity only, never dereference
++    IOMemoryDescriptor *descriptor;   // borrowed +0; owns/backs the entire S view
++    IOMemoryMap *mapping;             // borrowed +0; null for ordinary CPU view
++    const void *backing;              // borrowed +0; private prepared pool
++};
++static_assert(sizeof(void *) == 8 && sizeof(NvSCompletedView) == 80,
++              "completed staging lease is a pinned x86_64 kernel contract");
++using NvSConsumeCompleted = NvSConsumerResult (*)(void *, const NvSCompletedView *);
++
++// Control context, before presentation starts: at most one allocation plan.
++// No copy/state/publication lock may be held. No diagnostic budget is armed.
++int NvPrepareCompletedS(NVAccel *accelerator);
++
++// Terminal cancellation for this accelerator lifetime. Closes admission and
++// drains the copy lock, including an admitted synchronous consumer. Does not
++// wait for an allocation in progress; that preparation discards its result.
++// Must not be called from the consumer or while holding the publication gate.
++void NvCancelCompletedS(NVAccel *accelerator);
++
++// Caller owns live accelerator/source/RM references for the duration of call,
++// and has satisfied the existing producer completion/fence requirement. Caller
++// captures FB Describe BEFORE this call; opaque context preserves that exact
++// ticket/FB/serial through the callback. Existing IOAccel transaction locks may
++// be held; caller must NOT hold copy/provider-state/publication locks. Ordering:
++// IOAccel caller -> short provider state (released) -> console pin (released)
++// -> copy -> short state/RM
++// -> synchronous consumer/publication gate. No state lock is held during RM or
++// consumer. Publication must never call back into FB/IOAccel/RM or the provider.
++// This preserves the existing transaction scheduling; it does not assert that
++// unobserved IOAccel internals are lock-free or independently runtime-qualified.
++// Performs ONE S-only pageoff; no A address is accepted or looked up. The copy
++// lock protects pool through callback return. Source allocation is separately
++// pinned by an authoritative owner-bound allocator record before this lock. Consumer must not retain
++// or escape any pointer, reenter this provider, or call cancellation/preparation.
++// Consumer may acquire the publication gate after RM completion. Compose and
++// bounded verification use this SAME S; no second source-generation readback.
++// PixelsEstablished takes precedence over a notification enqueue error. Every
++// outcome is terminal for this frame: caller must NOT fall into a second writer.
++NvSProviderResult NvProduceCompletedS(NVAccel *accelerator, NVVidMemory *source,
++    IOService *rm, void *kapiDevice, UInt32 width, UInt32 height, UInt32 pitch,
++    NvSConsumeCompleted consumer, void *context);
++
++// Allocation lifetime revision: pin admission requires an exact source owner
++// binding to this allocator/device and sufficient recorded allocation extent.
++// Identity comes from this protected record, not mutable VM handle/cookie fields.
++// Deallocation detaches the owner but defers physical free until last pin drops;
++// an ambiguous submitted failure preserves the pin permanently. Pin release is
++// AFTER copy/publication unlock. This proves allocation lifetime only; source
++// producer completion/content stability remain the existing caller contract.
+diff --git a/kexts/NVRM/accel/hyperv/HyperVCompletedFrameAbi.hpp b/kexts/NVRM/accel/hyperv/HyperVCompletedFrameAbi.hpp
+new file mode 100644
+index 0000000..8d7b643
+--- /dev/null
++++ b/kexts/NVRM/accel/hyperv/HyperVCompletedFrameAbi.hpp
+@@ -0,0 +1,66 @@
++#ifndef HYPERV_COMPLETED_FRAME_ABI_HPP
++#define HYPERV_COMPLETED_FRAME_ABI_HPP
++#include <stddef.h>
++#include <stdint.h>
++
++/* NEW driver-owned, synchronous trusted-kernel contract. These names are not
++ * existing Apple/IOAccel private APIs. No user pointers, async leases or raw A
++ * addresses are returned. Version1 is x86_64 only and locked to full publication. */
++#define HP_FN_DESCRIBE "HyperVPublicationDescribeV1"
++#define HP_FN_ACQUIRE "HyperVPublicationAcquireV1"
++#define HP_FN_COMMIT "HyperVPublicationCommitCompletedV1"
++#define HP_FN_REVOKE "HyperVPublicationRevokeV1"
++enum { HP_ABI_VERSION=1, HP_FORMAT_BGRA8888=1 };
++enum class HPOperation : uint32_t { Describe=1, Acquire=2, Commit=3, Revoke=4 };
++enum class HPStatus : uint32_t { Ok=0, BadBuffer, BadVersion, BadRequest, WrongRoute, CoreRejected };
++enum : uint32_t {
++    HP_REPLY_FULL_ONLY=1, HP_REPLY_READY=2, HP_REPLY_PIXELS_ESTABLISHED=4,
++    HP_REPLY_NOTIFY_ATTEMPTED=8, HP_REPLY_QUEUED=16, HP_REPLY_DEBT=32
++};
++enum : uint32_t { HP_LEASE_COMPLETED_CACHED_IMMUTABLE=1 };
++enum : uint32_t { HP_COMMIT_VERIFY_COMPOSED=1, HP_COMMIT_SAMPLE_WORDS=2, HP_MAX_SAMPLE_WORDS=40 };
++struct HPHeader { uint32_t bytes, version; };
++struct HPTicket { uint64_t output, epoch, ownerGeneration, producerToken; };
++struct HPGeometry {
++    uint32_t width,height,format,reserved;
++    uint64_t aperturePitch,apertureLength;
++};
++struct HPCompletedLease {
++    uint64_t cpuAddress,validLength,pitch,leaseIdentity,sourceIdentity;
++    uint32_t flags,reserved;
++};
++struct HPDescribe { HPHeader header; uint64_t expectedOutput; };
++struct HPAcquire { HPHeader header; HPTicket expected; uint32_t owner,reserved; };
++struct HPRevoke { HPHeader header; HPTicket ticket; };
++struct HPSampleRequest { uint64_t firstByte; uint32_t strideBytes,count; };
++struct HPCommit {
++    HPHeader header;
++    uint32_t flags,reserved; /* Only bounded VERIFY_COMPOSED. No partial/D API. */
++    HPTicket ticket;
++    uint64_t serial;
++    HPGeometry geometry;
++    HPCompletedLease source;
++    HPSampleRequest sample; /* Diagnostic only; bounded visible-A words. */
++};
++struct HPVerification {
++    uint64_t comparedWords,badWords,firstByte;
++    uint32_t expected,actual,minX,minY,maxX,maxY;
++    uint32_t attempted,complete;
++};
++struct HPWordSamples { uint32_t attempted,count; uint32_t words[HP_MAX_SAMPLE_WORDS]; };
++struct HPReply {
++    HPHeader header;
++    HPStatus status;
++    uint32_t coreStatus,flags,reserved;
++    HPTicket ticket;
++    HPGeometry geometry;
++    uint64_t acceptedSerial;
++    HPVerification verification;
++    HPWordSamples samples;
++};
++static_assert(sizeof(uintptr_t)==8,"completed-frame ABI requires qualified x86_64 kernel");
++static_assert(sizeof(HPTicket)==32 && sizeof(HPGeometry)==32 && sizeof(HPCompletedLease)==48,"ABI layout");
++static_assert(sizeof(HPDescribe)==16 && sizeof(HPAcquire)==48 && sizeof(HPRevoke)==40,"ABI requests");
++static_assert(sizeof(HPCommit)==152 && sizeof(HPReply)==320 && sizeof(HPVerification)==56,"ABI commit/result");
++static_assert(offsetof(HPCommit,source)==88 && offsetof(HPReply,geometry)==56,"ABI offsets");
++#endif
+diff --git a/kexts/NVRM/accel/hyperv/HyperVGraphicsPlatformFunctions.hpp b/kexts/NVRM/accel/hyperv/HyperVGraphicsPlatformFunctions.hpp
+new file mode 100644
+index 0000000..7787e23
+--- /dev/null
++++ b/kexts/NVRM/accel/hyperv/HyperVGraphicsPlatformFunctions.hpp
+@@ -0,0 +1,40 @@
++//
++//  HyperVGraphicsPlatformFunctions.hpp
++//  Hyper-V synthetic graphics driver platform function definitions
++//
++//  Copyright © 2025 Goldfish64. All rights reserved.
++//
++
++#ifndef HyperVGraphicsPlatformFunctions_hpp
++#define HyperVGraphicsPlatformFunctions_hpp
++
++//
++// Platform function names.
++//
++#define kHyperVGraphicsPlatformFunctionInit               "HyperVGraphicsPlatformFunctionInit"
++#define kHyperVGraphicsPlatformFunctionSetResolution      "HyperVGraphicsPlatformFunctionSetResolution"
++#define kHyperVGraphicsPlatformFunctionSetCursorShape     "HyperVGraphicsPlatformFunctionSetCursorShape"
++#define kHyperVGraphicsPlatformFunctionSetCursorPosition  "HyperVGraphicsPlatformFunctionSetCursorPosition"
++#define kHyperVGraphicsPlatformFunctionPresent            "HyperVGraphicsPlatformFunctionPresent"
++#define kHyperVGraphicsPlatformFunctionDmaTestPage        "HyperVGraphicsPlatformFunctionDmaTestPage"
++
++// Private, size-checked ABI shared by the transport and its framebuffer.
++// Coordinates are exclusive at the right/bottom edge. A full frame remains
++// necessary when the producer has no authoritative damage information.
++struct HyperVGraphicsPresent {
++  UInt32 width, height;
++  UInt32 x1, y1, x2, y2;
++};
++
++//
++// HyperVGraphicsPlatformFunctionSetCursorShape parameters
++//
++typedef struct {
++  UInt8   *cursorData;
++  UInt32  width;
++  UInt32  height;
++  UInt32  hotX;
++  UInt32  hotY;
++} HyperVGraphicsPlatformFunctionSetCursorShapeParams;
++
++#endif
+diff --git a/kexts/NVRM/accel/hyperv/HyperVPublicationLifecycle.hpp b/kexts/NVRM/accel/hyperv/HyperVPublicationLifecycle.hpp
+new file mode 100644
+index 0000000..a1224f1
+--- /dev/null
++++ b/kexts/NVRM/accel/hyperv/HyperVPublicationLifecycle.hpp
+@@ -0,0 +1,46 @@
++#ifndef HYPERV_PUBLICATION_LIFECYCLE_HPP
++#define HYPERV_PUBLICATION_LIFECYCLE_HPP
++#include "HyperVCompletedFrameAbi.hpp"
++/* Driver-owned synchronous kernel-only ABI. All pointers are borrowed until
++ * return. Attach retains the supplied precreated B mapping, never the FB.
++ * Neither Describe nor any other request exposes the physical aperture A. */
++#define HP_FN_CONTROL "HyperVPublicationControlV1"
++#define HP_FN_ROUTED "HyperVPublicationRoutedV1"
++#define HP_FN_CPU_FRAME "HyperVPublicationCPUFrameV1"
++enum class HPControlKind : uint32_t {
++    Attach=1, Detach, BindAccelerator, ModeBegin, ModeFinish, SetupResult,
++    Accelerated, ToLegacy, Defer, CursorInvalid, CursorShape, CursorPosition,
++    CursorRefresh, CursorUnclassified, CursorCapabilitiesRecorded
++};
++struct HPControl {
++    HPHeader header;
++    HPControlKind kind;
++    uint32_t value;
++    uint64_t framebufferIdentity, expectedEpoch, objectIdentity;
++    uint64_t backingMap; /* Attach only: IOMemoryMap*, +0 */
++    uint32_t width,height;
++    uint64_t pixels, pixelBytes; /* CursorShape only: straight ARGB */
++    uint32_t hotX,hotY;
++    int32_t x,y; /* Already converted-image TOP-LEFT. */
++};
++/* FB supplies route identities from binding; they are not trusted from the
++ * accelerator's commit bytes. Only known sibling NVAccel gets that route. */
++struct HPRoutedCall {
++    HPHeader header;
++    uint64_t framebufferIdentity,producerIdentity;
++    HPOperation operation;
++    uint32_t reserved;
++    const void *input;
++    size_t inputBytes;
++    HPReply *reply;
++};
++/* CPU/legacy sources are synchronously snapshotted into preallocated S by the
++ * publisher. This is not an immutable-GPU-lease assertion. No caller A/B write. */
++struct HPCPUFrame {
++    HPHeader header;
++    HPTicket expected;
++    uint64_t cpuAddress, validLength,pitch;
++    uint32_t width,height;
++};
++static_assert(sizeof(HPControl)==88 && sizeof(HPRoutedCall)==56 && sizeof(HPCPUFrame)==72,"lifecycle ABI");
++#endif
+diff --git a/kexts/NVRM/accel/hyperv/core/publication-coordinator.h b/kexts/NVRM/accel/hyperv/core/publication-coordinator.h
+new file mode 100644
+index 0000000..5475059
+--- /dev/null
++++ b/kexts/NVRM/accel/hyperv/core/publication-coordinator.h
+@@ -0,0 +1,146 @@
++#ifndef PUBLICATION_COORDINATOR_H
++#define PUBLICATION_COORDINATOR_H
++#include <stddef.h>
++#include <stdint.h>
++#include "vendor/exact-row-damage.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define PC_VERSION 1u
++#define PC_CORE_REVISION 3u
++#define PC_BGRA8888 1u
++#define PC_FRAME_ACTUAL_SNAPSHOT 1u
++#define PC_FRAME_FORCE_FULL 2u
++
++typedef enum PCStatus {
++    PC_OK=0, PC_BAD_INPUT, PC_NOT_READY, PC_STALE, PC_OLD_SERIAL,
++    PC_BUSY, PC_STORE_FAILED, PC_EXHAUSTED, PC_STOPPED
++} PCStatus;
++typedef enum PCOwner { PC_OWNER_NONE=0, PC_OWNER_ACCELERATED=1, PC_OWNER_LEGACY=2 } PCOwner;
++typedef enum PCDebtKind { PC_DEBT_EMPTY=0, PC_DEBT_ROWS=1, PC_DEBT_FULL=2 } PCDebtKind;
++
++typedef struct PCGeometry {
++    uint32_t width, height, format;
++    size_t aperture_pitch, aperture_length; /* Committed destination layout. */
++} PCGeometry;
++typedef struct PCTicket {
++    uint64_t output, epoch, owner_generation, producer_token;
++} PCTicket;
++typedef struct PCStorage {
++    unsigned char *reference; size_t reference_capacity;
++    unsigned char *row_mask; size_t mask_capacity;
++} PCStorage;
++typedef struct PCDebt { PCDebtKind kind; uint32_t first_row, end_row; } PCDebt;
++
++/* Caller-allocated state, not a wire ABI. Fields are exposed for storage only:
++ * do not change or copy a live state. All APIs require external serialization.
++ * This object and its storage must outlive callbacks and be mutually disjoint. */
++typedef struct PCState {
++    uint64_t magic;
++    PCStorage storage;
++    PCGeometry geometry;
++    uint64_t output, epoch, owner_generation, next_token, producer_token;
++    uint64_t last_seen_serial, last_accepted_serial;
++    uint64_t session, debt_revision;
++    PCOwner owner;
++    PCDebt debt;
++    unsigned ready, transitioning, reference_valid, image_established;
++    unsigned busy, stopped, exhausted;
++} PCState;
++
++typedef struct PCFrame {
++    uint32_t size, version, flags, reserved;
++    PCTicket ticket;
++    uint64_t serial;
++    PCGeometry geometry;
++    ExactRowView source;       /* Completed immutable S, cached RAM only. */
++    ExactRowView actual;       /* Immutable full D captured under SAME lease. */
++} PCFrame;
++
++/* Synchronous callback descriptions, not a cross-kext wire ABI. */
++typedef struct PCWrite {
++    PCTicket ticket;
++    uint64_t serial;
++    PCGeometry geometry;
++    ExactRowView source;
++    const unsigned char *row_mask;
++    size_t mask_bytes;
++} PCWrite;
++typedef struct PCNotice {
++    uint32_t size, version;
++    uint64_t output, epoch, session, debt_revision;
++    uint32_t width, height, x1, y1, x2, y2; /* Exclusive right/bottom. */
++    PCDebtKind kind;
++} PCNotice;
++
++typedef struct PCOps {
++    /* 0 means ALL selected rows established and existing publication ordering
++     * completed. Nonzero means possibly partial stores: strict invalidation.
++     * The source/mask remain borrowed and immutable. No async DMA here. */
++    int (*write_rows)(void *context, const PCWrite *write);
++    /* 0 means synchronous ring enqueue only, never host consumption. */
++    int (*enqueue)(void *context, const PCNotice *notice);
++    void *context;
++    ExactRowCompare compare; /* NULL = pinned scalar exact-row primitive. */
++    void *compare_context;
++    /* Optional trusted exact cached-R copy: copy exactly n bytes, no allocation,
++     * failure, asynchronous work, callback reentry or writes outside dst[0,n).
++     * Source/destination are validated disjoint. NULL uses scalar byte stores.
++     * This is NOT the aperture store callback and introduces no new fence. */
++    void (*copy_reference)(void *context, unsigned char *destination,
++                           const unsigned char *source, size_t n);
++    void *copy_context;
++} PCOps;
++
++typedef struct PCResult {
++    PCStatus status;
++    unsigned pixels_established; /* This input accepted, even if send fails. */
++    unsigned store_attempted;
++    unsigned notify_attempted, notification_queued, debt_retained;
++    uint64_t accepted_serial;
++} PCResult;
++typedef struct PCSnapshot {
++    PCTicket ticket;
++    PCGeometry geometry;
++    PCOwner owner;
++    PCDebt debt;
++    uint64_t last_seen_serial, last_accepted_serial, session, debt_revision;
++    unsigned ready, transitioning, reference_valid, image_established;
++    unsigned busy, stopped, exhausted;
++} PCSnapshot;
++
++/* New output identity must be nonzero and never reused for a replaced output.
++ * Init does not touch backing bytes. Initial state requires finish_mode. */
++PCStatus pc_init(PCState *state, uint64_t output, PCStorage storage);
++PCSnapshot pc_snapshot(const PCState *state);
++/* begin_mode revokes admission BEFORE external mode work. On failure/rollback,
++ * finish_mode(old geometry) commits it under the NEW epoch, never the old one. */
++PCStatus pc_begin_mode(PCState *state);
++PCStatus pc_finish_mode(PCState *state, PCGeometry geometry);
++PCStatus pc_acquire(PCState *state, PCOwner owner);
++PCStatus pc_revoke(PCState *state);
++PCStatus pc_stop(PCState *state); /* Terminal; no memory freed by the core. */
++
++/* Only these debt mutations may be called reentrantly from write/enqueue.
++ * They must still be serialized, not invoked from a concurrent receive thread.
++ * session reset means bytes/mode preserved; otherwise revoke/begin_mode too. */
++PCStatus pc_request_full(PCState *state);
++/* Integration extension: already-established composed cursor rows. Checked
++ * coordinates, same gate, durable revisioned notification debt. This does not
++ * assert pixel establishment or change uncursored R. Empty input is a no-op. */
++PCStatus pc_request_rows(PCState *state, uint32_t first_row, uint32_t end_row);
++PCStatus pc_new_notification_session(PCState *state);
++
++/* Synchronous; caller holds one publication lease from BEFORE D capture until
++ * return. No allocation, locking, RM, MMIO capture, source fencing or lifetime
++ * management is supplied here. Numeric validation cannot prove ownership.
++ * A retained notification debt is not permission for a second pixel writer. */
++PCResult pc_commit(PCState *state, PCFrame frame, PCOps ops);
++PCResult pc_flush(PCState *state, PCOps ops); /* Retry with no new producer frame. */
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/kexts/NVRM/accel/hyperv/core/vendor/exact-row-damage.h b/kexts/NVRM/accel/hyperv/core/vendor/exact-row-damage.h
+new file mode 100644
+index 0000000..b61639b
+--- /dev/null
++++ b/kexts/NVRM/accel/hyperv/core/vendor/exact-row-damage.h
+@@ -0,0 +1,77 @@
++#ifndef EXACT_ROW_DAMAGE_H
++#define EXACT_ROW_DAMAGE_H
++#include <stddef.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* Cached, CPU-readable, stable memory only. No MMIO/device pointers. The caller
++ * establishes completion/coherency/lifetime and keeps both views immutable for
++ * the entire call. No source/surface identity shortcut is part of this API. */
++typedef struct ExactRowView {
++    const unsigned char *bytes;
++    size_t pitch;
++    size_t length;
++} ExactRowView;
++
++/* Trusted adapter contract: compare exactly n accessible bytes, zero if equal,
++ * nonzero otherwise; no input/mask writes, sampling, hashes, padding reads,
++ * allocation or notification. Must accept arbitrary byte alignment. Private
++ * context may hold instrumentation but must not alias input or mask storage;
++ * this opaque context contract is the trusted adapter's responsibility.
++ * NULL selects scalar. */
++typedef int (*ExactRowCompare)(const unsigned char *current,
++    const unsigned char *reference, size_t n, void *context);
++
++typedef enum ExactRowKind {
++    EXACT_ROW_BAD_INPUT = 0, /* Not an empty result. Caller must not suppress work. */
++    EXACT_ROW_EMPTY = 1,
++    EXACT_ROW_UNION = 2
++} ExactRowKind;
++
++typedef enum ExactRowReference {
++    EXACT_ROW_REFERENCE_NOT_USED = 0, /* BAD_INPUT only. */
++    EXACT_ROW_REFERENCE_COMPARED = 1,
++    EXACT_ROW_REFERENCE_UNESTABLISHED = 2,
++    EXACT_ROW_REFERENCE_UNUSABLE = 3
++} ExactRowReference;
++
++typedef struct ExactRowDamage {
++    ExactRowKind kind;
++    ExactRowReference reference;
++    size_t first_row;
++    size_t end_row;       /* Exclusive. EMPTY/BAD_INPUT both report 0,0. */
++    size_t mask_bytes;    /* Written bytes, zero on BAD_INPUT. */
++} ExactRowDamage;
++
++/* width/height > 0; visible row bytes are exactly width*4 (BGRA incl. alpha).
++ * Independent pitches must cover that width; the final row needs no padding.
++ * Caller supplies ceil(height/8) writable mask bytes. Bit (y%8) of byte y/8
++ * means row y changed. Unused high bits are zero; excess mask capacity is not
++ * touched. A UNION denotes [0,width) x [first_row,end_row), bridging row gaps.
++ *
++ * reference_valid==0 ignores the reference view and forces every row changed.
++ * If reference_valid!=0 but its geometry/range is unusable, also force full.
++ * This does not establish a reference or carry notification debt forward.
++ *
++ * BAD_INPUT rejects invalid current geometry/ranges, missing/short mask, or
++ * mask overlap with current or an address-valid, asserted reference extent.
++ * It writes no mask bytes and invokes no callback. The caller must use its
++ * explicit error/full-frame fallback, not interpret BAD_INPUT as no damage.
++ * Buffers must actually be mapped and accessible: numeric validation cannot
++ * prove allocation ownership, mapping, coherency or epoch validity.
++ *
++ * No allocation, SIMD intrinsics, libc calls, writer or notification occurs.
++ * Integration must also prohibit compiler-generated unqualified SIMD/builtins
++ * with the kernel's compilation settings; see INTEGRATION.md. */
++ExactRowDamage exact_row_damage(size_t width, size_t height,
++    ExactRowView current, ExactRowView reference, int reference_valid,
++    unsigned char *changed_rows, size_t mask_capacity,
++    ExactRowCompare compare, void *compare_context);
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/kexts/NVRM/accel/iofam/IOAccel2DContext2.h b/kexts/NVRM/accel/iofam/IOAccel2DContext2.h
+index 32d75a8..985ed7c 100644
+--- a/kexts/NVRM/accel/iofam/IOAccel2DContext2.h
++++ b/kexts/NVRM/accel/iofam/IOAccel2DContext2.h
+@@ -20,6 +20,6 @@ public:
+     virtual void _RESERVEDIOAccel2DContext4();
+     virtual void _RESERVEDIOAccel2DContext5();
+ private:
+-    uint8_t _opaque[kIOAccel2DContext2Size - sizeof(IOAccelContext2)];
++    alignas(void *) uint8_t _opaque[kIOAccel2DContext2Size - sizeof(IOAccelContext2)];
+ };
+ static_assert(sizeof(IOAccel2DContext2) == kIOAccel2DContext2Size, "IOAccel2DContext2 must be 0x1100 bytes");
+diff --git a/kexts/NVRM/accel/iofam/IOAccelCLContext2.h b/kexts/NVRM/accel/iofam/IOAccelCLContext2.h
+index 872866e..1f06c1d 100644
+--- a/kexts/NVRM/accel/iofam/IOAccelCLContext2.h
++++ b/kexts/NVRM/accel/iofam/IOAccelCLContext2.h
+@@ -18,6 +18,6 @@ public:
+     virtual void _RESERVEDIOAccelCLContext4();
+     virtual void _RESERVEDIOAccelCLContext5();
+ private:
+-    uint8_t _opaque[kIOAccelCLContext2Size - sizeof(IOAccelContext2)];
++    alignas(void *) uint8_t _opaque[kIOAccelCLContext2Size - sizeof(IOAccelContext2)];
+ };
+ static_assert(sizeof(IOAccelCLContext2) == kIOAccelCLContext2Size, "IOAccelCLContext2 must be 0x10e8 bytes");
+diff --git a/kexts/NVRM/accel/iofam/IOAccelContext2.h b/kexts/NVRM/accel/iofam/IOAccelContext2.h
+index 5c362c3..766eac7 100644
+--- a/kexts/NVRM/accel/iofam/IOAccelContext2.h
++++ b/kexts/NVRM/accel/iofam/IOAccelContext2.h
+@@ -61,6 +61,6 @@ public:
+     virtual void contextModeBits() const;
+     virtual void describeDriverAllocations(IOAccelAllocationInfo*);
+ private:
+-    uint8_t _opaque[kIOAccelContext2Size - sizeof(IOAccelSubmitter2)];
++    alignas(void *) uint8_t _opaque[kIOAccelContext2Size - sizeof(IOAccelSubmitter2)];
+ };
+ static_assert(sizeof(IOAccelContext2) == kIOAccelContext2Size, "IOAccelContext2 must be 0x10a8 bytes");
+diff --git a/kexts/NVRM/accel/iofam/IOAccelDisplayMachine.h b/kexts/NVRM/accel/iofam/IOAccelDisplayMachine.h
+index 164b939..6af8c6c 100644
+--- a/kexts/NVRM/accel/iofam/IOAccelDisplayMachine.h
++++ b/kexts/NVRM/accel/iofam/IOAccelDisplayMachine.h
+@@ -32,6 +32,6 @@ public:
+ 
+     unsigned int getFramebufferCount() const;
+ private:
+-    uint8_t _opaque[kIOAccelDisplayMachineSize - sizeof(IOService)];
++    alignas(void *) uint8_t _opaque[kIOAccelDisplayMachineSize - sizeof(IOService)];
+ };
+ static_assert(sizeof(IOAccelDisplayMachine) == kIOAccelDisplayMachineSize, "IOAccelDisplayMachine must be 376 bytes");
+diff --git a/kexts/NVRM/accel/iofam/IOAccelDisplayPipe.h b/kexts/NVRM/accel/iofam/IOAccelDisplayPipe.h
+index 27b296a..5392675 100644
+--- a/kexts/NVRM/accel/iofam/IOAccelDisplayPipe.h
++++ b/kexts/NVRM/accel/iofam/IOAccelDisplayPipe.h
+@@ -52,6 +52,6 @@ public:
+     virtual void framebuffer_did_power_on();
+     virtual void framebuffer_terminated();
+ private:
+-    uint8_t _opaque[kIOAccelDisplayPipeSize - sizeof(IOService)];
++    alignas(void *) uint8_t _opaque[kIOAccelDisplayPipeSize - sizeof(IOService)];
+ };
+ static_assert(sizeof(IOAccelDisplayPipe) == kIOAccelDisplayPipeSize, "IOAccelDisplayPipe must be 0x318 bytes");
+diff --git a/kexts/NVRM/accel/iofam/IOAccelEventMachine2.h b/kexts/NVRM/accel/iofam/IOAccelEventMachine2.h
+index 413403c..b513879 100644
+--- a/kexts/NVRM/accel/iofam/IOAccelEventMachine2.h
++++ b/kexts/NVRM/accel/iofam/IOAccelEventMachine2.h
+@@ -61,6 +61,6 @@ public:
+     virtual void _RESERVEDIOAccelEventMachine4();
+     virtual void _RESERVEDIOAccelEventMachine5();
+ private:
+-    uint8_t _opaque[kIOAccelEventMachine2Size - sizeof(OSObject)];
++    alignas(void *) uint8_t _opaque[kIOAccelEventMachine2Size - sizeof(OSObject)];
+ };
+ static_assert(sizeof(IOAccelEventMachine2) == kIOAccelEventMachine2Size, "IOAccelEventMachine2 must be 240 bytes");
+diff --git a/kexts/NVRM/accel/iofam/IOAccelEventMachineFast2.h b/kexts/NVRM/accel/iofam/IOAccelEventMachineFast2.h
+index d14bbf9..0c468c4 100644
+--- a/kexts/NVRM/accel/iofam/IOAccelEventMachineFast2.h
++++ b/kexts/NVRM/accel/iofam/IOAccelEventMachineFast2.h
+@@ -58,6 +58,6 @@ public:
+     virtual void _RESERVEDIOAccelEventMachineFast4();
+     virtual void _RESERVEDIOAccelEventMachineFast5();
+ private:
+-    uint8_t _opaque2[kIOAccelEventMachineFast2Size - kIOAccelEventMachine2Size];
++    alignas(void *) uint8_t _opaque2[kIOAccelEventMachineFast2Size - kIOAccelEventMachine2Size];
+ };
+ static_assert(sizeof(IOAccelEventMachineFast2) == kIOAccelEventMachineFast2Size, "IOAccelEventMachineFast2 must be 3376 bytes");
+diff --git a/kexts/NVRM/accel/iofam/IOAccelGLContext2.h b/kexts/NVRM/accel/iofam/IOAccelGLContext2.h
+index fee5766..28dea36 100644
+--- a/kexts/NVRM/accel/iofam/IOAccelGLContext2.h
++++ b/kexts/NVRM/accel/iofam/IOAccelGLContext2.h
+@@ -25,6 +25,6 @@ public:
+     virtual void _RESERVEDIOAccelGLContext4();
+     virtual void _RESERVEDIOAccelGLContext5();
+ private:
+-    uint8_t _opaque[kIOAccelGLContext2Size - sizeof(IOAccelContext2)];
++    alignas(void *) uint8_t _opaque[kIOAccelGLContext2Size - sizeof(IOAccelContext2)];
+ };
+ static_assert(sizeof(IOAccelGLContext2) == kIOAccelGLContext2Size, "IOAccelGLContext2 must be 0x1238 bytes");
+diff --git a/kexts/NVRM/accel/iofam/IOAccelLegacyDisplayMachine.h b/kexts/NVRM/accel/iofam/IOAccelLegacyDisplayMachine.h
+index 916bf50..5f75133 100644
+--- a/kexts/NVRM/accel/iofam/IOAccelLegacyDisplayMachine.h
++++ b/kexts/NVRM/accel/iofam/IOAccelLegacyDisplayMachine.h
+@@ -33,6 +33,6 @@ public:
+     virtual void enableFlipInterrupt(unsigned int);
+     virtual void disableFlipInterrupt(unsigned int);
+ private:
+-    uint8_t _opaque2[kIOAccelLegacyDisplayMachineSize - kIOAccelDisplayMachineSize];
++    alignas(void *) uint8_t _opaque2[kIOAccelLegacyDisplayMachineSize - kIOAccelDisplayMachineSize];
+ };
+ static_assert(sizeof(IOAccelLegacyDisplayMachine) == kIOAccelLegacyDisplayMachineSize, "IOAccelLegacyDisplayMachine must be 504 bytes");
+diff --git a/kexts/NVRM/accel/iofam/IOAccelLegacyDisplayPipe.h b/kexts/NVRM/accel/iofam/IOAccelLegacyDisplayPipe.h
+index 021bf6a..76b17b9 100644
+--- a/kexts/NVRM/accel/iofam/IOAccelLegacyDisplayPipe.h
++++ b/kexts/NVRM/accel/iofam/IOAccelLegacyDisplayPipe.h
+@@ -24,6 +24,6 @@ public:
+     virtual void resetScanout(IOAccelEvent*, IOAccelResource2*, IOAccelResource2*);
+     virtual bool isCurrentModeAcceleratorBacked();
+ private:
+-    uint8_t _opaque[kIOAccelLegacyDisplayPipeSize - sizeof(IOAccelDisplayPipe)];
++    alignas(void *) uint8_t _opaque[kIOAccelLegacyDisplayPipeSize - sizeof(IOAccelDisplayPipe)];
+ };
+ static_assert(sizeof(IOAccelLegacyDisplayPipe) == kIOAccelLegacyDisplayPipeSize, "IOAccelLegacyDisplayPipe must be 0x380 bytes");
+diff --git a/kexts/NVRM/accel/iofam/IOAccelLegacySurface.h b/kexts/NVRM/accel/iofam/IOAccelLegacySurface.h
+index 5d9c794..8cecb50 100644
+--- a/kexts/NVRM/accel/iofam/IOAccelLegacySurface.h
++++ b/kexts/NVRM/accel/iofam/IOAccelLegacySurface.h
+@@ -11,7 +11,11 @@ enum { kIOAccelLegacySurfaceSize = 0x13b0 };
+ class IOAccelLegacySurface : public IOAccelSurface {
+     OSDeclareDefaultStructors(IOAccelLegacySurface);
+ public:
+-    virtual void setSyncCommand(unsigned int*, unsigned int&, unsigned int&, _AMDSurfaceSwapSyncOptions const&) const = 0;
++    // macOS 15 IOAccelLegacySurface::submit_swap calls vtable slot 0xa38
++    // with an event, source/destination resources and swap options. The old
++    // AMD setSyncCommand declaration described a different method/ABI.
++    virtual void submitLegacySwap(IOAccelEvent*, IOAccelResource2*, IOAccelResource2*,
++                                  unsigned int*, unsigned int, unsigned int, bool, IOAccelBounds const*) = 0;
+     virtual void didSubmitSwap(unsigned int, unsigned int);
+     virtual bool isBackBufferReady(unsigned int);
+     virtual void submitCopyForward(IOAccelEvent*, unsigned int, IOAccelResource2*, IOAccelResource2*, IOAccelBounds const*, unsigned int);
+@@ -19,6 +23,6 @@ public:
+     virtual void pickPresentType(unsigned int);
+     virtual void _pure335() = 0;
+ private:
+-    uint8_t _opaque[kIOAccelLegacySurfaceSize - sizeof(IOAccelSurface)];
++    alignas(void *) uint8_t _opaque[kIOAccelLegacySurfaceSize - sizeof(IOAccelSurface)];
+ };
+ static_assert(sizeof(IOAccelLegacySurface) == kIOAccelLegacySurfaceSize, "IOAccelLegacySurface must be 0x13b0 bytes");
+diff --git a/kexts/NVRM/accel/iofam/IOAccelMemory.h b/kexts/NVRM/accel/iofam/IOAccelMemory.h
+index 3ebbc5b..dc86b4d 100644
+--- a/kexts/NVRM/accel/iofam/IOAccelMemory.h
++++ b/kexts/NVRM/accel/iofam/IOAccelMemory.h
+@@ -20,7 +20,7 @@ public:
+     virtual bool prepare();
+     virtual bool complete();
+     virtual uint64_t getPhysicalSegment(unsigned long long, unsigned long long*) = 0;
+-    virtual void setPurgeable(unsigned int, unsigned int*) = 0;
++    virtual IOReturn setPurgeable(unsigned int, unsigned int*) = 0;
+     virtual uint64_t setTag(unsigned int) = 0;
+     virtual uint64_t getTag() = 0;
+     virtual bool matchForReuse(void*, unsigned long long) = 0;
+@@ -37,6 +37,6 @@ public:
+     virtual void increment_wire_count() = 0;
+     virtual void decrement_wire_count() = 0;
+ private:
+-    uint8_t _opaque[kIOAccelMemorySize - sizeof(OSObject)];
++    alignas(void *) uint8_t _opaque[kIOAccelMemorySize - sizeof(OSObject)];
+ };
+ static_assert(sizeof(IOAccelMemory) == kIOAccelMemorySize, "IOAccelMemory must be 0xb0 bytes");
+diff --git a/kexts/NVRM/accel/iofam/IOAccelMemoryMap.h b/kexts/NVRM/accel/iofam/IOAccelMemoryMap.h
+index 1e0c092..582cd4b 100644
+--- a/kexts/NVRM/accel/iofam/IOAccelMemoryMap.h
++++ b/kexts/NVRM/accel/iofam/IOAccelMemoryMap.h
+@@ -34,6 +34,6 @@ public:
+     virtual void _RESERVEDIOAccelMemoryMap5();
+     virtual void redirect(IOAccelMemory *);
+ private:
+-    uint8_t _opaque[kIOAccelMemoryMapSize - sizeof(OSObject)];
++    alignas(void *) uint8_t _opaque[kIOAccelMemoryMapSize - sizeof(OSObject)];
+ };
+ static_assert(sizeof(IOAccelMemoryMap) == kIOAccelMemoryMapSize, "IOAccelMemoryMap must be 280 bytes");
+diff --git a/kexts/NVRM/accel/iofam/IOAccelResource2.h b/kexts/NVRM/accel/iofam/IOAccelResource2.h
+index 92727bf..6fe6462 100644
+--- a/kexts/NVRM/accel/iofam/IOAccelResource2.h
++++ b/kexts/NVRM/accel/iofam/IOAccelResource2.h
+@@ -56,6 +56,9 @@ public:
+     virtual void pageonIfNeeded();
+     virtual void gartEvent();
+ private:
+-    uint8_t _opaque[kIOAccelResource2Size - sizeof(OSObject)];
++    // Begin opaque storage at sizeof(OSObject), not in its reusable tail
++    // padding. Otherwise sizeof(this class) still rounds to 0x180 but a
++    // derived uint32_t can overwrite the family's map pointer at 0x178.
++    alignas(void *) uint8_t _opaque[kIOAccelResource2Size - sizeof(OSObject)];
+ };
+ static_assert(sizeof(IOAccelResource2) == kIOAccelResource2Size, "IOAccelResource2 must be 0x180 bytes");
+diff --git a/kexts/NVRM/accel/iofam/IOAccelShared2.h b/kexts/NVRM/accel/iofam/IOAccelShared2.h
+index 2fdbdf0..74836e6 100644
+--- a/kexts/NVRM/accel/iofam/IOAccelShared2.h
++++ b/kexts/NVRM/accel/iofam/IOAccelShared2.h
+@@ -22,6 +22,6 @@ public:
+     virtual void _RESERVEDIOAccelShared4();
+     virtual void _RESERVEDIOAccelShared5();
+ private:
+-    uint8_t _opaque[kIOAccelShared2Size - sizeof(OSObject)];
++    alignas(void *) uint8_t _opaque[kIOAccelShared2Size - sizeof(OSObject)];
+ };
+ static_assert(sizeof(IOAccelShared2) == kIOAccelShared2Size, "IOAccelShared2 must be 0x138 bytes");
+diff --git a/kexts/NVRM/accel/iofam/IOAccelSubmitter2.h b/kexts/NVRM/accel/iofam/IOAccelSubmitter2.h
+index e61b326..4b61c2c 100644
+--- a/kexts/NVRM/accel/iofam/IOAccelSubmitter2.h
++++ b/kexts/NVRM/accel/iofam/IOAccelSubmitter2.h
+@@ -28,6 +28,6 @@ public:
+     virtual void _RESERVEDIOAccelSubmitter5();
+     virtual bool isOpportunisticWorkload() const;
+ private:
+-    uint8_t _opaque[kIOAccelSubmitter2Size - sizeof(IOUserClient)];
++    alignas(void *) uint8_t _opaque[kIOAccelSubmitter2Size - sizeof(IOUserClient)];
+ };
+ static_assert(sizeof(IOAccelSubmitter2) == kIOAccelSubmitter2Size, "IOAccelSubmitter2 must be 0x568 bytes");
+diff --git a/kexts/NVRM/accel/iofam/IOAccelSurface.h b/kexts/NVRM/accel/iofam/IOAccelSurface.h
+index 86e3c79..c914dd3 100644
+--- a/kexts/NVRM/accel/iofam/IOAccelSurface.h
++++ b/kexts/NVRM/accel/iofam/IOAccelSurface.h
+@@ -39,6 +39,6 @@ public:
+     virtual void surface_unlock_options(eLockType, unsigned int);
+     virtual void surface_control_with_lock(unsigned int, unsigned int, unsigned int*);
+ private:
+-    uint8_t _opaque[kIOAccelSurfaceSize - sizeof(IOUserClient)];
++    alignas(void *) uint8_t _opaque[kIOAccelSurfaceSize - sizeof(IOUserClient)];
+ };
+ static_assert(sizeof(IOAccelSurface) == kIOAccelSurfaceSize, "IOAccelSurface must be 0x1338 bytes");
+diff --git a/kexts/NVRM/accel/iofam/IOAccelSysMemory.h b/kexts/NVRM/accel/iofam/IOAccelSysMemory.h
+index d3aa9a3..25d0948 100644
+--- a/kexts/NVRM/accel/iofam/IOAccelSysMemory.h
++++ b/kexts/NVRM/accel/iofam/IOAccelSysMemory.h
+@@ -14,7 +14,7 @@ public:
+     virtual uint64_t getDirtySize() const APPLE_KEXT_OVERRIDE;
+     virtual uint64_t getResidentSize() const APPLE_KEXT_OVERRIDE;
+     virtual uint64_t getPhysicalSegment(unsigned long long, unsigned long long*) APPLE_KEXT_OVERRIDE;
+-    virtual void setPurgeable(unsigned int, unsigned int*) APPLE_KEXT_OVERRIDE;
++    virtual IOReturn setPurgeable(unsigned int, unsigned int*) APPLE_KEXT_OVERRIDE;
+     virtual uint64_t setTag(unsigned int) APPLE_KEXT_OVERRIDE;
+     virtual uint64_t getTag() APPLE_KEXT_OVERRIDE;
+     virtual bool matchForReuse(void*, unsigned long long) APPLE_KEXT_OVERRIDE;
+@@ -29,6 +29,6 @@ public:
+     virtual void _RESERVEDIOAccelSysMemory4();
+     virtual void _RESERVEDIOAccelSysMemory5();
+ private:
+-    uint8_t _opaque[kIOAccelSysMemorySize - sizeof(IOAccelMemory)];
++    alignas(void *) uint8_t _opaque[kIOAccelSysMemorySize - sizeof(IOAccelMemory)];
+ };
+ static_assert(sizeof(IOAccelSysMemory) == kIOAccelSysMemorySize, "IOAccelSysMemory must be 0x198 bytes");
+diff --git a/kexts/NVRM/accel/iofam/IOAccelTask.h b/kexts/NVRM/accel/iofam/IOAccelTask.h
+index 4e9102f..704f2f6 100644
+--- a/kexts/NVRM/accel/iofam/IOAccelTask.h
++++ b/kexts/NVRM/accel/iofam/IOAccelTask.h
+@@ -28,6 +28,6 @@ public:
+     virtual void _RESERVEDIOAccelTask5();
+     virtual void freeWaitToAllocGPUAddress(IOAccelMemoryMap *, bool);
+ private:
+-    uint8_t _opaque[kIOAccelTaskSize - sizeof(OSObject)];
++    alignas(void *) uint8_t _opaque[kIOAccelTaskSize - sizeof(OSObject)];
+ };
+ static_assert(sizeof(IOAccelTask) == kIOAccelTaskSize, "IOAccelTask must be 600 bytes");
+diff --git a/kexts/NVRM/accel/iofam/IOAccelVidMemory.h b/kexts/NVRM/accel/iofam/IOAccelVidMemory.h
+index 025d238..12018a4 100644
+--- a/kexts/NVRM/accel/iofam/IOAccelVidMemory.h
++++ b/kexts/NVRM/accel/iofam/IOAccelVidMemory.h
+@@ -13,7 +13,7 @@ class IOAccelVidMemory : public IOAccelMemory {
+ public:
+     virtual uint64_t getDirtySize() const APPLE_KEXT_OVERRIDE;
+     virtual uint64_t getResidentSize() const APPLE_KEXT_OVERRIDE;
+-    virtual void setPurgeable(unsigned int, unsigned int*) APPLE_KEXT_OVERRIDE;
++    virtual IOReturn setPurgeable(unsigned int, unsigned int*) APPLE_KEXT_OVERRIDE;
+     virtual uint64_t setTag(unsigned int) APPLE_KEXT_OVERRIDE;
+     virtual uint64_t getTag() APPLE_KEXT_OVERRIDE;
+     virtual bool matchForReuse(void*, unsigned long long) APPLE_KEXT_OVERRIDE;
+@@ -31,6 +31,6 @@ public:
+     virtual void _RESERVEDIOAccelVidMemory4();
+     virtual void _RESERVEDIOAccelVidMemory5();
+ private:
+-    uint8_t _opaque[kIOAccelVidMemorySize - sizeof(IOAccelMemory)];
++    alignas(void *) uint8_t _opaque[kIOAccelVidMemorySize - sizeof(IOAccelMemory)];
+ };
+ static_assert(sizeof(IOAccelVidMemory) == kIOAccelVidMemorySize, "IOAccelVidMemory must be 0x110 bytes");
+diff --git a/kexts/NVRM/accel/iofam/IOAccelVideoContext2.h b/kexts/NVRM/accel/iofam/IOAccelVideoContext2.h
+index f4109ec..055c1dc 100644
+--- a/kexts/NVRM/accel/iofam/IOAccelVideoContext2.h
++++ b/kexts/NVRM/accel/iofam/IOAccelVideoContext2.h
+@@ -18,6 +18,6 @@ public:
+     virtual void _RESERVEDIOAccelVideoContext4();
+     virtual void _RESERVEDIOAccelVideoContext5();
+ private:
+-    uint8_t _opaque[kIOAccelVideoContext2Size - sizeof(IOAccelContext2)];
++    alignas(void *) uint8_t _opaque[kIOAccelVideoContext2Size - sizeof(IOAccelContext2)];
+ };
+ static_assert(sizeof(IOAccelVideoContext2) == kIOAccelVideoContext2Size, "IOAccelVideoContext2 must be 0x10e8 bytes");
+diff --git a/kexts/NVRM/accel/nvaccel_stubs.h b/kexts/NVRM/accel/nvaccel_stubs.h
+index eb24b3b..feca869 100644
+--- a/kexts/NVRM/accel/nvaccel_stubs.h
++++ b/kexts/NVRM/accel/nvaccel_stubs.h
+@@ -54,12 +54,17 @@ public:
+     IOMemoryDescriptor *fApDesc = nullptr;
+ };
+ OSDefineMetaClassAndStructors(NVResource, IOAccelResource2)
++// HYPERV-CARRY (ABI): derived fields must start after the family's 0x180-byte object, never in OSObject tail padding
++// (fPbLogged once overwrote the high half of the family's map pointer at 0x178). See the alignas(void *) in iofam/re.
++static_assert(__builtin_offsetof(NVResource, fPbLogged) >= kIOAccelResource2Size,
++              "NVResource fields must not reuse the Apple object's tail");
+ class NVSysMemory : public IOAccelSysMemory {
+     OSDeclareDefaultStructors(NVSysMemory)
+     NM_TAHOE_FWD(NVSysMemory)
+ public:
+ };
+ OSDefineMetaClassAndStructors(NVSysMemory, IOAccelSysMemory)
++class NVAccel;
+ class NVVidMemory : public IOAccelVidMemory {
+     OSDeclareDefaultStructors(NVVidMemory)
+     NM_TAHOE_FWD(NVVidMemory)
+@@ -76,6 +81,15 @@ public:
+     unsigned long long fParkPhys = 0, fParkBytes = 0, fParkCookie = 0;
+     void releaseVram(void *handle, void *kva, unsigned long long bytes, unsigned long long cookie);
+     void releaseParked();
++    // HYPERV-CARRY: VRAM that NVAccel allocates itself (Hyper-V console, no NVRMFB). After all preexisting fields.
++    // fConsoleAllocator holds +1 on the allocating NVAccel while this VM owns (or has parked) a console allocation;
++    // fConsoleManaged is sticky once set, so a VM never mixes the console and the NVRMFB routes.
++    NVAccel *fConsoleAllocator = nullptr;
++    UInt32 fConsoleManaged = 0;
++    IOLock *fConsoleBindingLock = nullptr;
++    IOLock *consoleBindingLock();
++    NVAccel *consoleDetachLocked(unsigned long long *bytes);
++    IOReturn setPurgeable(unsigned int newState, unsigned int *oldState) APPLE_KEXT_OVERRIDE;
+ 
+     bool allocPhysical() APPLE_KEXT_OVERRIDE;
+     void deallocPhysical() APPLE_KEXT_OVERRIDE;
+@@ -93,7 +107,10 @@ class NVSurface : public IOAccelLegacySurface {
+     OSDeclareDefaultStructors(NVSurface)
+     NM_TAHOE_FWD(NVSurface)
+ public:
+-    void setSyncCommand(unsigned int* a0, unsigned int& a1, unsigned int& a2, _AMDSurfaceSwapSyncOptions const& a3) const APPLE_KEXT_OVERRIDE { ALOG("NVSurface::setSyncCommand"); }
++    // HYPERV-CARRY (ABI): vtable slot 0xa38 is submit_swap's legacy swap, not AMD's setSyncCommand (see
++    // IOAccelLegacySurface.h). Behaviour is unchanged: the legacy swap is still not implemented here.
++    void submitLegacySwap(IOAccelEvent*, IOAccelResource2*, IOAccelResource2*, unsigned int*,
++                          unsigned int, unsigned int, bool, IOAccelBounds const*) APPLE_KEXT_OVERRIDE { ALOG("NVSurface::setSyncCommand"); }
+     void _pure335() APPLE_KEXT_OVERRIDE { ALOG("NVSurface::_pure335"); }
+     bool copyFromBuffer(int a0, int a1, int a2, int a3, unsigned int a4, unsigned int a5, IOAccelEvent* a6, IOAccelResource2* a7, IOAccelSysMemory* a8, unsigned int a9, unsigned long long a10, unsigned int a11) APPLE_KEXT_OVERRIDE { ALOG("NVSurface::copyFromBuffer"); return false; }
+     bool copyToBuffer(int a0, int a1, int a2, int a3, unsigned int a4, unsigned int a5, IOAccelEvent* a6, IOAccelResource2* a7, IOAccelSysMemory* a8, unsigned int a9, unsigned long long a10, unsigned int a11) APPLE_KEXT_OVERRIDE { ALOG("NVSurface::copyToBuffer"); return false; }
+diff --git a/kexts/NVRM/accel/nvrm-accel.cpp b/kexts/NVRM/accel/nvrm-accel.cpp
+index 49b4036..92e5ddc 100644
+--- a/kexts/NVRM/accel/nvrm-accel.cpp
++++ b/kexts/NVRM/accel/nvrm-accel.cpp
+@@ -55,6 +55,59 @@ uint64_t mach_absolute_time(void);
+ void absolutetime_to_nanoseconds(uint64_t abstime, uint64_t *result);
+ void proc_selfname(char *buf, int size);
+ }
++// BEGIN HYPERV-CARRY: declarations for the Hyper-V synthetic console head (MacHyperVSupport's HyperVGraphicsFramebuffer
++// under this GPU's IOPCIDevice). WindowServer composites on this GPU; frames reach the Hyper-V aperture either through
++// the private publication ABI (HyperVPrivatePublication, the deployed framebuffer) or, for an older framebuffer that
++// describes its aperture, by a GPU copy-engine write straight into it plus a Present notification.
++#include "hyperv/HyperVGraphicsPlatformFunctions.hpp"
++#include "NvCompletedStaging.hpp"
++#include "hyperv/HyperVPublicationLifecycle.hpp"
++#include "hyperv/core/publication-coordinator.h"
++// Driver-owned allocation records: no overlay of any Apple/NVIDIA private allocation.
++struct NvConsoleAllocation {
++    NVRMVramRequest memory;
++    NvKmsKapiDevice *device;
++    NVVidMemory *owner;      // weak identity; dereferenced only with a caller's live VM
++    NvConsoleAllocation *next;
++    UInt64 pins;
++    bool ownerBound, retiring, parked;
++};
++struct NvConsoleSourcePin {
++    NvConsoleAllocation *record;
++    NVRMVramRequest memory;
++    NvKmsKapiDevice *device;
++};
++// The qualified Hyper-V 4K console offer is 32 MiB; every presentation path stays under this bound.
++static const UInt64 kNvConsoleMaxFrameBytes = 32ull << 20;
++static int gConsoleDirectMode = 1;          // debug.nvaccel_console_direct: 0 = CPU copies only
++static bool gConsoleDirectFailed = false;   // a GPU copy failed this boot: CPU fallback from then on
++static volatile SInt64 gCntConsoleDirect, gCntConsoleDirectRefused, gCntConsoleDmaRefused;
++static volatile SInt64 gCntConsolePresent, gCntConsolePresentRefused, gCntPublicationStale, gCntIopCpuCopies;
++class NVAccel;
++static void nvStageStart(NVAccel *a);
++static void nvStageStop(NVAccel *a);
++static const OSSymbol *gNvPublicationDescribeSymbol = nullptr, *gNvPublicationCommitSymbol = nullptr,
++                      *gNvPublicationCPUSymbol = nullptr;
++static bool nvConsoleFramebuffer(IOService *fb)
++{
++    return fb && fb->metaCast("HyperVGraphicsFramebuffer") && fb->getProperty("HyperVConsoleTransport") == kOSBooleanTrue;
++}
++static bool nvPrivatePublication(IOService *fb)
++{
++    return nvConsoleFramebuffer(fb) && fb->getProperty("HyperVPrivatePublication") == kOSBooleanTrue;
++}
++static bool nvPublicationDescribe(IOService *fb, HPReply *reply)
++{
++    if (!fb || !reply || !gNvPublicationDescribeSymbol) return false;
++    HPDescribe request = {{sizeof(request), HP_ABI_VERSION}, 0};
++    return fb->callPlatformFunction(gNvPublicationDescribeSymbol, false, &request, reinterpret_cast<void *>(sizeof(request)),
++               reply, reinterpret_cast<void *>(sizeof(*reply))) == kIOReturnSuccess &&
++           reply->header.bytes == sizeof(*reply) && reply->header.version == HP_ABI_VERSION &&
++           reply->status == HPStatus::Ok && (reply->flags & HP_REPLY_READY);
++}
++static IOReturn nvPublicationProduce(NVAccel *, IOService *, NVVidMemory *, unsigned, unsigned, unsigned);
++static IOReturn nvPublicationCPU(IOService *, const void *, uint64_t, unsigned, unsigned, unsigned);
++// END HYPERV-CARRY
+ static volatile SInt64 gCntVmAlloc, gCntVmAllocBytes, gCntVmDealloc, gCntVmDeallocBytes, gCntVmRefused,
+                        gCntResNew, gCntResFree, gCntMapCommit, gCntMapRelease, gCntMapFree;
+ static void nvaccelInstallSysctl(void);
+@@ -85,7 +138,7 @@ extern "C" kern_return_t _start(kmod_info_t *ki, void *d); extern "C" kern_retur
+ #ifdef NMX_ACCEL
+ extern "C" { KMOD_EXPLICIT_DECL(com.nullmoth.NMXAccel, "0.1", _start, _stop) }
+ #else
+-extern "C" { KMOD_EXPLICIT_DECL(com.nullmoth.NVAccel, "0.1", _start, _stop) }
++extern "C" { KMOD_EXPLICIT_DECL(com.nullmoth.NVAccel, "2.3.1d1", _start, _stop) }   // HYPERV-CARRY: 2.3.1-hv1
+ #endif
+ extern "C" kern_return_t _start(kmod_info_t *ki, void *d) { return KERN_SUCCESS; }
+ extern "C" kern_return_t _stop(kmod_info_t *ki, void *d)  { return KERN_SUCCESS; }
+@@ -109,6 +162,7 @@ OSDefineMetaClassAndStructors(NVEventMachine, IOAccelEventMachineFast2)
+ static void (*gEnableAccel)(const char *why) = nullptr;
+ static int gNvScanout = 0;
+ static int gNvAperture = 0;
++static int gNvIop = 0;   // HYPERV-CARRY: declared here (was below) so the console registration can open it
+ class NVDisplayMachine : public IOAccelLegacyDisplayMachine {
+     OSDeclareDefaultStructors(NVDisplayMachine)
+     NM_TAHOE_FWD(NVDisplayMachine)
+@@ -228,7 +282,7 @@ public:
+              p, kNvMaxFB, *(const uint32_t *)(p + 0x2c));
+     }
+     bool      configureDevice(IOPCIDevice *pci) APPLE_KEXT_OVERRIDE { ALOG("configureDevice(%p) %04x:%04x — RM owns the card (NVRM.kext); nothing to do here yet", pci, pci ? pci->configRead16(0) : 0, pci ? pci->configRead16(2) : 0); return true; }
+-    void      teardownDevice(IOPCIDevice *pci) APPLE_KEXT_OVERRIDE { ALOG("teardownDevice(%p)", pci); }
++    void      teardownDevice(IOPCIDevice *pci) APPLE_KEXT_OVERRIDE { consoleCloseAllocations(); ALOG("teardownDevice(%p)", pci); }
+     OSObject *createKernelGPUTask() APPLE_KEXT_OVERRIDE { return newGPUTask("createKernelGPUTask"); }
+     OSObject *newDisplayPipe() APPLE_KEXT_OVERRIDE {
+         NVDisplayPipe *p = OSTypeAlloc(NVDisplayPipe);
+@@ -251,6 +305,33 @@ public:
+     IOPCIDevice *fPCI = nullptr;
+     IONotifier *fFBNote = nullptr;
+     IONotifier *fIntelNote = nullptr;
++    // BEGIN HYPERV-CARRY: console head state. Lock order: (family lock) -> fConsoleCopyLock -> fConsoleLock / stage
++    // lock. Nothing that holds fConsoleLock or the stage lock takes the copy lock or the family lock.
++    IONotifier *fConsoleFBNote = nullptr;
++    bool configureConsolePresentation(IOService *fb);
++    IOLock *fConsoleLock = nullptr;
++    IOLock *fConsoleCopyLock = nullptr;
++    unsigned long long *fConsoleDirectPages = nullptr;
++    UInt64 fConsoleDirectPageCapacity = 0, fConsoleDirectBase = 0;
++    bool fConsoleDmaDisabled = false;
++    NvKmsKapiFunctionsTable *fConsoleKms = nullptr;
++    NvKmsKapiDevice *fConsoleDevice = nullptr;
++    NvU64 (*fConsolePhysForVa)(void *) = nullptr;
++    NvConsoleAllocation *fConsoleAllocations = nullptr;
++    bool fConsoleAllocationsClosed = false;
++    UInt64 fConsoleBytes = 0, fConsoleCookie = 0;
++    bool consoleDeviceReady();
++    IOReturn consoleVram(NVRMVramRequest *request, bool alloc);
++    unsigned consoleReapLocked();
++    IOReturn consoleAllocateLocked(NVRMVramRequest *, NVVidMemory *);
++    IOReturn consoleAllocateOwner(NVVidMemory *, NVRMVramRequest *);
++    void consoleReleaseOwner(NVVidMemory *, NVRMVramRequest *);
++    bool consoleParkOwner(NVVidMemory *);
++    IOReturn consoleUnparkOwner(NVVidMemory *, UInt64 want);
++    bool consolePinSource(NVVidMemory *, void *, UInt64, NvConsoleSourcePin *);
++    void consoleUnpinSource(NvConsoleSourcePin *);
++    void consoleCloseAllocations();
++    // END HYPERV-CARRY
+     static NVAccel *gAccel;
+     IOService *fFB = nullptr;
+     IOService *volatile fFBs[kNvMaxFB] = {};
+@@ -261,6 +342,9 @@ public:
+         (void)ref; (void)note;
+         NVAccel *me = (NVAccel *)target;
+         if (!me || !newService) return true;
++        // HYPERV-CARRY: the console transport and the rendering GPU are separate devices; accept only the console that
++        // MacHyperVSupport published under THIS GPU. NVRMFB heads (provider NVRMDisplay) and NMIntelFB are not affected.
++        if (newService->metaCast("HyperVGraphicsFramebuffer") && newService->getProvider() != me->fPCI) return true;
+         unsigned idx = 0;
+         OSNumber *num = OSDynamicCast(OSNumber, newService->getProperty("IOFBDependentIndex"));
+         if (num) idx = num->unsigned32BitValue();
+@@ -293,6 +377,7 @@ public:
+                  "and WindowServer composites it only after a WindowServer restart", idx);
+         else
+             ALOG("  to register it:  sudo sysctl -w debug.nvaccelfb=1   (2 = re-run the family's own sweep)");
++        if (nvConsoleFramebuffer(newService)) me->configureConsolePresentation(newService);   // HYPERV-CARRY
+         return true;
+     }
+     // Headless GPU (laptops whose panel and outputs are all on the Intel or AMD GPU: issues #76, #106). NVKMS finds no
+@@ -379,14 +464,36 @@ public:
+                          "this walk", why, i, gNvHeadsPublished);
+                 break;
+             }
+-            if (fFBRegistered & (1u << i)) continue;
++            // HYPERV-CARRY: the Hyper-V console publishes before its first open, and the family's own publication callback
++            // may register it before ours. For the console only: retry until it has a pipe, adopt a real family pipe that
++            // already drives it, and record it as registered only once a pipe exists. Other heads keep upstream's rule.
++            const bool console = nvConsoleFramebuffer(fb);
++            if (console ? (gNvHeadsPiped & (1u << i)) != 0 : (fFBRegistered & (1u << i)) != 0) continue;
+             if (i == 4 && !gNvIgpu) break;   // the Intel panel waits for debug.nvaccel_igpu=1
+             unsigned b = fDM->getFramebufferCount();
++            if (console) {
++                bool adopted = false;
++                for (unsigned slot = 0; b <= kNvMaxFB && slot < b; slot++) {
++                    const uint8_t *pipe = *(const uint8_t *const volatile *)((const uint8_t *)fDM + 0x88 + 8 * slot);
++                    if (pipe && *(IOService *const volatile *)(pipe + 0x98) == fb) {
++                        fFBRegistered |= 1u << i;
++                        gNvHeadsRegistered = fFBRegistered;
++                        gNvHeadsPiped |= 1u << i;
++                        added++;
++                        adopted = true;
++                        ALOG("  %s: adopted the family's existing pipe %u for the Hyper-V console (index %u)", why, slot, i);
++                        break;
++                    }
++                }
++                if (adopted) continue;
++            }
+             ALOG("  %s: calling found_framebuffer(%s index %u) -- count before %u", why, fb->getName(), i, b);
+             fDM->found_framebuffer((IOFramebuffer *)fb);
+             unsigned c = fDM->getFramebufferCount();
+-            fFBRegistered |= 1u << i;
+-            gNvHeadsRegistered = fFBRegistered;
++            if (!console) {
++                fFBRegistered |= 1u << i;
++                gNvHeadsRegistered = fFBRegistered;
++            }
+             if (c != b + 1) {
+                 ALOG("  %s: index %u -- count went %u -> %u; the family did not add it (already known, or the cap "
+                      "accel+0xcb0 = %u refused it). Stopping here so no later head takes this one's pipe number.",
+@@ -410,12 +517,17 @@ public:
+             }
+             ALOG("  %s: index %u -> pipe %u (%p), count %u", why, i, b, pipe, c);
+             gNvHeadsPiped |= 1u << i;
++            fFBRegistered |= 1u << i;
++            gNvHeadsRegistered = fFBRegistered;
+             added++;
+         }
+         return added;
+     }
+     void onCountGrewLocked() {
+-        deliverModeChange();
++        // HYPERV-CARRY: IOFramebuffer's controller gate does not exist until its first open, and the console publishes
++        // earlier; it gets the family's real open/mode notifications instead of a fabricated pre-open change.
++        if (!nvConsoleFramebuffer(fFB))
++            deliverModeChange();
+         gNvAccelArmed = 1;
+         if (fMetalPlugin && !getProperty("MetalPluginName")) {
+             setProperty("MetalPluginName", fMetalPlugin);
+@@ -439,20 +551,23 @@ public:
+         if (!fFB) { ALOG("registerFramebuffer(%d): no framebuffer has published yet", how); return false; }
+         unsigned before = fDM->getFramebufferCount();
+         ALOG("registerFramebuffer(%d): framebuffer count before = %u", how, before);
++        unsigned added = 0;
+         if (how == 2) {
+             if (before != 0) ALOG("  already %u -- refusing to re-run the family's sweep", before);
+             else { ALOG("  re-running IOAccelDisplayMachine::start(pci) -- the family's own sweep"); fDM->start(fPCI); }
+         } else {
+-            registerPendingLocked("sysctl");
++            added = registerPendingLocked("sysctl");
+         }
+         unsigned after = fDM->getFramebufferCount();
+         ALOG("  framebuffer count after = %u", after);
+-        if (after > before) { onCountGrewLocked(); return true; }
++        // HYPERV-CARRY: an adopted console pipe adds a head without growing the count
++        if (after > before || added) { onCountGrewLocked(); return true; }
+         return false;
+     }
+     const OSSymbol *fSymAlloc = nullptr, *fSymFree = nullptr;
+     IOReturn askFramebufferForVram(struct NVRMVramRequest *r, bool alloc) {
+         if (!fFB) return kIOReturnNotAttached;
++        if (nvConsoleFramebuffer(fFB)) return consoleVram(r, alloc);   // HYPERV-CARRY: no NVRMFB, NVAccel's own KAPI VRAM
+         if (!fSymAlloc) fSymAlloc = OSSymbol::withCStringNoCopy(NVRM_VRAM_FN_ALLOC);
+         if (!fSymFree)  fSymFree  = OSSymbol::withCStringNoCopy(NVRM_VRAM_FN_FREE);
+         const OSSymbol *fn = alloc ? fSymAlloc : fSymFree;
+@@ -532,7 +647,7 @@ public:
+                      "change -- not delivering it twice", how);
+             else {
+                 ALOG("sysctl debug.nvaccelfb=%d: scanout-backed display pipe ENABLED, re-delivering the mode change", how);
+-                gAccel->deliverModeChange();
++                if (!nvConsoleFramebuffer(gAccel->fFB)) gAccel->deliverModeChange();   // HYPERV-CARRY: see onCountGrewLocked
+             }
+             if (gAccel->fRegLock) IOLockUnlock(gAccel->fRegLock);
+             return;
+@@ -618,6 +733,22 @@ public:
+             fPCI = OSDynamicCast(IOPCIDevice, provider);
+             ALOG("display machine framebuffer count after the family sweep = %u", fDM ? fDM->getFramebufferCount() : 0xFFFFFFFFu);
+             fRegLock = IOLockAlloc();
++#ifndef NMX_ACCEL
++            // BEGIN HYPERV-CARRY: console locks, publication symbols and the completed-frame pool, all in this cold
++            // context before any framebuffer can match. The symbols are boot-lifetime references.
++            fConsoleLock = IOLockAlloc();
++            fConsoleCopyLock = IOLockAlloc();
++            nvStageStart(this);
++            if (!gNvPublicationDescribeSymbol) gNvPublicationDescribeSymbol = OSSymbol::withCStringNoCopy(HP_FN_DESCRIBE);
++            if (!gNvPublicationCommitSymbol) gNvPublicationCommitSymbol = OSSymbol::withCStringNoCopy(HP_FN_COMMIT);
++            if (!gNvPublicationCPUSymbol) gNvPublicationCPUSymbol = OSSymbol::withCStringNoCopy(HP_FN_CPU_FRAME);
++            {
++                const int completedStatus = (fConsoleLock && fConsoleCopyLock && gNvPublicationDescribeSymbol &&
++                    gNvPublicationCommitSymbol && gNvPublicationCPUSymbol) ? NvPrepareCompletedS(this) : ENOMEM;
++                setProperty("HyperVCompletedSPrepareStatus", static_cast<UInt32>(completedStatus), 32);
++            }
++            // END HYPERV-CARRY
++#endif
+             ALOG("multi-head: up to %u heads, registration lock %p%s", kNvMaxFB, fRegLock,
+                  fRegLock ? "" : " -- NULL: two sysctl writers could interleave a registration");
+ #ifdef NMX_ACCEL
+@@ -651,15 +782,338 @@ public:
+                     armHeadlessCheck();
+                 }
+             } else ALOG("serviceMatching(NVRMFramebuffer) returned NULL -- cannot watch for the framebuffer");
++#ifndef NMX_ACCEL
++            // HYPERV-CARRY: the Hyper-V console framebuffer (and its NVDA-named subclass) becomes head 0; fbPublished
++            // accepts only the one published under this GPU's IOPCIDevice.
++            if (fConsoleLock && fConsoleCopyLock) {
++                if (OSDictionary *console = serviceMatching("HyperVGraphicsFramebuffer")) {
++                    fConsoleFBNote = addMatchingNotification(gIOFirstPublishNotification, console,
++                                                             &NVAccel::fbPublished, this, nullptr, 0);
++                    console->release();
++                    ALOG("watching for the Hyper-V console framebuffer -> notifier %p", fConsoleFBNote);
++                }
++            }
++#endif
+         }
+         return r;
+     }
+-    virtual void stop(IOService *provider) APPLE_KEXT_OVERRIDE { ALOG("stop"); IOGraphicsAccelerator2::stop(provider); }
++    virtual void stop(IOService *provider) APPLE_KEXT_OVERRIDE {
++        // HYPERV-CARRY: stop console matching, close admission to the console allocator and the completed-frame pool
++        // (draining an in-flight frame), then the family. Order matters: NvCancelCompletedS needs the stage owner.
++        if (fConsoleFBNote) { fConsoleFBNote->remove(); fConsoleFBNote = nullptr; }
++        consoleCloseAllocations();
++        NvCancelCompletedS(this);
++        nvStageStop(this);
++        ALOG("stop"); IOGraphicsAccelerator2::stop(provider);
++    }
+     virtual IOReturn callPlatformFunction(const OSSymbol *fn, bool wait, void *p1, void *p2, void *p3, void *p4) APPLE_KEXT_OVERRIDE;
+ };
+ OSDefineMetaClassAndStructors(NVAccel, IOGraphicsAccelerator2)
+ NVAccel *NVAccel::gAccel = nullptr;
+ 
++// BEGIN HYPERV-CARRY: console head registration, KAPI staging VRAM and the console allocation records
++bool NVAccel::configureConsolePresentation(IOService *fb)
++{
++    if (!fb || !fPCI || fb != fFB || fb->getProvider() != fPCI || !nvConsoleFramebuffer(fb) ||
++        fPCI->configRead16(0) != 0x10de || fPCI->configRead16(2) != 0x28a0 ||
++        fPCI->getProperty("HyperVPCIUsesNegotiatedResources") != kOSBooleanTrue)
++        return false;
++    NVRMVramRequest q = {};
++    q.version = NVRM_VRAM_ABI_VERSION;
++    if (nvPrivatePublication(fb)) {
++        if (fb->callPlatformFunction("HyperVPublicationBindV1", false, this, nullptr, nullptr, nullptr) != kIOReturnSuccess)
++            return false;
++        HPReply description = {};
++        if (!nvPublicationDescribe(fb, &description)) return false;
++        q.width = description.geometry.width; q.height = description.geometry.height;
++        q.pitch = static_cast<UInt32>(description.geometry.aperturePitch); q.actualSize = uint64_t(q.pitch) * q.height;
++    } else if (askFramebufferForScanout(&q, fb) != kIOReturnSuccess || !q.kva || !q.actualSize)
++        return false; // enableController retries after committed geometry exists
++    OSDictionary *caps = OSDictionary::withCapacity(2);
++    if (!caps) return false;
++    caps->setObject("DisplayPipeSupported", kOSBooleanTrue);
++    caps->setObject("TransactionsSupported", kOSBooleanTrue);
++    setProperty("IOAccelDisplayPipeCapabilities", caps);
++    caps->release();
++    gNvIop = 1;
++    gNvScanout = 1;
++    gNvAperture = 1;
++    registerFramebuffer(1);
++    const bool piped = (gNvHeadsPiped & 1u) != 0;
++    ALOG("Hyper-V console ready: %ux%u pitch %u, registered 0x%x piped 0x%x",
++         q.width, q.height, q.pitch, gNvHeadsRegistered, gNvHeadsPiped);
++    // 2.3.1 boot guard (nvrm_off.h): only NVRMFB clears nullmoth-nv-starts, and here the display is the Hyper-V console,
++    // so NVRMFB may never reach its clear. A console head with a display pipe is this driver's display path being up:
++    // clear the counter exactly as NVRMFB would, so two such boots do not turn the driver off on the third.
++    if (piped) nvrm_guard_display_up("the Hyper-V console head has a display pipe");
++    return piped;
++}
++
++static void consoleKmsEvent(const NvKmsKapiEvent *) { }
++
++// Caller holds fConsoleLock.
++bool NVAccel::consoleDeviceReady()
++{
++    if (fConsoleAllocationsClosed) return false;
++    if (fConsoleDevice) return true;
++    if (!fPCI || !fConsoleLock || !nvConsoleFramebuffer(fFB)) return false;
++    // Resolve the KAPI table from this GPU's own NVRM display nub (NVRM.cpp nvrm_display_publish).
++    IOService *rm = nullptr;
++    OSIterator *children = fPCI->getChildIterator(gIOServicePlane);
++    if (children) {
++        while (OSObject *object = children->getNextObject()) {
++            IOService *service = OSDynamicCast(IOService, object);
++            if (service && service->metaCast("NVRM")) { rm = service; break; }
++        }
++        children->release();
++    }
++    if (!rm) return false;
++    children = rm->getChildIterator(gIOServicePlane);
++    OSNumber *table = nullptr, *phys = nullptr, *gpuId = nullptr;
++    if (children) {
++        while (OSObject *object = children->getNextObject()) {
++            IOService *service = OSDynamicCast(IOService, object);
++            if (!service || !service->metaCast("NVRMDisplay")) continue;
++            table = OSDynamicCast(OSNumber, service->getProperty("nvkms-kapi"));
++            phys = OSDynamicCast(OSNumber, service->getProperty("phys-for-va"));
++            gpuId = OSDynamicCast(OSNumber, service->getProperty("gpu-id"));
++            if (table && phys && gpuId) break;
++        }
++        children->release();
++    }
++    if (!table || !phys || !gpuId || !table->unsigned64BitValue() || !phys->unsigned64BitValue()) return false;
++    fConsoleKms = (NvKmsKapiFunctionsTable *)(uintptr_t)table->unsigned64BitValue();
++    fConsolePhysForVa = (NvU64 (*)(void *))(uintptr_t)phys->unsigned64BitValue();
++    if (!fConsoleKms->allocateDevice || !fConsoleKms->allocateMemory || !fConsoleKms->mapMemory ||
++        !fConsoleKms->unmapMemory || !fConsoleKms->freeMemory || !fConsoleKms->freeDevice) return false;
++    NvKmsKapiAllocateDeviceParams params = {};
++    params.gpuId = gpuId->unsigned32BitValue();
++    params.privateData = this;
++    params.eventCallback = consoleKmsEvent;
++    fConsoleDevice = fConsoleKms->allocateDevice(&params);
++    if (!fConsoleDevice) return false;
++    ALOG("Hyper-V staging: allocated an NVIDIA KAPI memory device for GPU 0x%x", params.gpuId);
++    return true;
++}
++
++// All *Locked functions require fConsoleLock and never take the copy, stage or publication locks. Reaping returns the
++// accelerator releases owed AFTER unlock.
++unsigned NVAccel::consoleReapLocked()
++{
++    unsigned releases = 0;
++    NvConsoleAllocation **link = &fConsoleAllocations;
++    while (*link) {
++        NvConsoleAllocation *record = *link;
++        if (!record->retiring || record->pins) { link = &record->next; continue; }
++        fConsoleKms->unmapMemory(record->device, static_cast<NvKmsKapiMemory *>(record->memory.handle),
++                                 NVKMS_KAPI_MAPPING_TYPE_KERNEL, record->memory.kva);
++        fConsoleKms->freeMemory(record->device, static_cast<NvKmsKapiMemory *>(record->memory.handle));
++        fConsoleBytes -= record->memory.actualSize;
++        *link = record->next;
++        IOFree(record, sizeof(*record));
++        ++releases; // the record's retain; the caller releases outside every lock
++    }
++    if (fConsoleAllocationsClosed && !fConsoleAllocations && fConsoleDevice) {
++        fConsoleKms->freeDevice(fConsoleDevice);
++        fConsoleDevice = nullptr;
++    }
++    return releases;
++}
++
++IOReturn NVAccel::consoleAllocateLocked(NVRMVramRequest *request, NVVidMemory *owner)
++{
++    if (fConsoleAllocationsClosed || !consoleDeviceReady()) return kIOReturnNotReady;
++    if (!request->size || request->size > NVRM_VRAM_BAR1_BUDGET || fConsoleCookie == UINT64_MAX)
++        return kIOReturnNoMemory;
++    if (owner) {
++        if (__atomic_load_n(&owner->fConsoleAllocator, __ATOMIC_ACQUIRE) || owner->fRmHandle)
++            return kIOReturnBadArgument;
++        for (NvConsoleAllocation *r = fConsoleAllocations; r; r = r->next)
++            if (r->owner == owner) return kIOReturnBadArgument;
++    }
++    const UInt64 bytes = (request->size + 65535) & ~65535ull;
++    if (bytes > NVRM_VRAM_BAR1_BUDGET - fConsoleBytes) return kIOReturnNoMemory;
++    NvConsoleAllocation *record = static_cast<NvConsoleAllocation *>(IOMalloc(sizeof(NvConsoleAllocation)));
++    if (!record) return kIOReturnNoMemory;
++    *record = {};
++    NvKmsKapiAllocateMemoryParams params = {};
++    NvU8 compression = 0;
++    params.layout = NvKmsSurfaceMemoryLayoutPitch;
++    params.type = NVKMS_KAPI_ALLOCATION_TYPE_SCANOUT;
++    params.size = bytes; params.useVideoMemory = NV_TRUE; params.compressible = &compression;
++    NvKmsKapiMemory *memory = fConsoleKms->allocateMemory(fConsoleDevice, &params);
++    void *kva = nullptr;
++    const bool mapped = memory && fConsoleKms->mapMemory(fConsoleDevice, memory, NVKMS_KAPI_MAPPING_TYPE_KERNEL, &kva);
++    const UInt64 physical = mapped && kva ? fConsolePhysForVa(kva) : 0;
++    if (!physical) {
++        if (mapped) fConsoleKms->unmapMemory(fConsoleDevice, memory, NVKMS_KAPI_MAPPING_TYPE_KERNEL, kva);
++        if (memory) fConsoleKms->freeMemory(fConsoleDevice, memory);
++        IOFree(record, sizeof(*record));
++        return kIOReturnNoMemory;
++    }
++    record->memory.version = NVRM_VRAM_ABI_VERSION;
++    record->memory.size = record->memory.actualSize = bytes;
++    record->memory.phys = physical; record->memory.kva = kva; record->memory.handle = memory;
++    record->memory.allocationCookie = ++fConsoleCookie;
++    record->device = fConsoleDevice; record->owner = owner; record->ownerBound = owner != nullptr;
++    bzero(kva, static_cast<size_t>(bytes));
++    retain(); // every record keeps its original allocator alive, including across stop
++    record->next = fConsoleAllocations; fConsoleAllocations = record;
++    fConsoleBytes += bytes;
++    if (owner) {
++        owner->fRmHandle = memory; owner->fKva = kva; owner->fPhys = physical;
++        owner->fBytes = bytes; owner->fAllocationCookie = record->memory.allocationCookie;
++        // The binding has its own retain, handed back by NVVidMemory::consoleDetachLocked. Late deallocation never
++        // consults NVAccel::gAccel.
++        retain();
++        __atomic_store_n(&owner->fConsoleAllocator, this, __ATOMIC_RELEASE);
++    }
++    *request = record->memory; request->mappedTotal = fConsoleBytes;
++    return kIOReturnSuccess;
++}
++
++IOReturn NVAccel::consoleVram(NVRMVramRequest *request, bool alloc)
++{
++    if (!request || request->version != NVRM_VRAM_ABI_VERSION || !fConsoleLock)
++        return kIOReturnBadArgument;
++    IOLockLock(fConsoleLock);
++    IOReturn result = kIOReturnBadArgument;
++    unsigned releases = 0;
++    if (alloc) result = consoleAllocateLocked(request, nullptr);
++    else {
++        for (NvConsoleAllocation *r = fConsoleAllocations; r; r = r->next) {
++            if (r->memory.handle != request->handle || r->memory.allocationCookie != request->allocationCookie) continue;
++            // A raw handle/cookie call can never retire a VM-owned record, including a detached one held by a pin.
++            if (r->ownerBound) break;
++            r->retiring = true;
++            request->handle = request->kva = nullptr; request->phys = request->actualSize = 0;
++            result = kIOReturnSuccess; break;
++        }
++        releases = consoleReapLocked();
++    }
++    IOLockUnlock(fConsoleLock);
++    while (releases--) release(); // no field access after the final release
++    return result;
++}
++
++IOReturn NVAccel::consoleAllocateOwner(NVVidMemory *owner, NVRMVramRequest *request)
++{
++    if (!owner || !request || request->version != NVRM_VRAM_ABI_VERSION || !fConsoleLock)
++        return kIOReturnBadArgument;
++    IOLockLock(fConsoleLock);
++    const IOReturn result = consoleAllocateLocked(request, owner);
++    IOLockUnlock(fConsoleLock);
++    return result;
++}
++
++// Detach the owner's record (active or parked) and retire it; its memory is freed once no pin holds it. The caller
++// has claimed the binding retain and keeps it until this returns.
++void NVAccel::consoleReleaseOwner(NVVidMemory *owner, NVRMVramRequest *released)
++{
++    if (!fConsoleLock) return;
++    IOLockLock(fConsoleLock);
++    for (NvConsoleAllocation *r = fConsoleAllocations; r; r = r->next) {
++        if (!r->ownerBound || r->owner != owner || r->retiring) continue;
++        *released = r->memory;
++        r->owner = nullptr; r->retiring = true; r->parked = false;
++        owner->fRmHandle = nullptr; owner->fKva = nullptr; owner->fPhys = 0;
++        owner->fBytes = 0; owner->fAllocationCookie = 0;
++        break;
++    }
++    const unsigned releases = consoleReapLocked();
++    IOLockUnlock(fConsoleLock);
++    for (unsigned i = 0; i < releases; ++i) release();
++}
++
++// #200 (sticky VRAM) for console allocations: the family's deallocPhysical keeps the record bound to its VM, so the
++// memory the Metal plugin imported and keeps drawing into stays this surface's memory. A parked record is never a
++// presentation source (consolePinSource skips it) and keeps the same allocation identity (cookie) when it comes back.
++bool NVAccel::consoleParkOwner(NVVidMemory *owner)
++{
++    if (!fConsoleLock) return false;
++    bool parked = false;
++    IOLockLock(fConsoleLock);
++    for (NvConsoleAllocation *r = fConsoleAllocations; r; r = r->next) {
++        if (!r->ownerBound || r->owner != owner || r->retiring || r->parked) continue;
++        r->parked = true; parked = true;
++        owner->fRmHandle = nullptr; owner->fKva = nullptr; owner->fPhys = 0;
++        owner->fBytes = 0; owner->fAllocationCookie = 0;
++        break;
++    }
++    IOLockUnlock(fConsoleLock);
++    return parked;
++}
++
++// kIOReturnSuccess: the parked record is active again and the owner's fields describe it. kIOReturnNoSpace: it is
++// parked but smaller than want (the caller releases it). kIOReturnNotFound: nothing parked for this owner.
++IOReturn NVAccel::consoleUnparkOwner(NVVidMemory *owner, UInt64 want)
++{
++    if (!fConsoleLock) return kIOReturnNotFound;
++    IOReturn result = kIOReturnNotFound;
++    IOLockLock(fConsoleLock);
++    for (NvConsoleAllocation *r = fConsoleAllocations; r; r = r->next) {
++        if (!r->ownerBound || r->owner != owner || r->retiring || !r->parked) continue;
++        if (r->memory.actualSize < want) { result = kIOReturnNoSpace; break; }
++        r->parked = false;
++        owner->fRmHandle = r->memory.handle; owner->fKva = r->memory.kva; owner->fPhys = r->memory.phys;
++        owner->fBytes = r->memory.actualSize; owner->fAllocationCookie = r->memory.allocationCookie;
++        result = kIOReturnSuccess;
++        break;
++    }
++    IOLockUnlock(fConsoleLock);
++    return result;
++}
++
++bool NVAccel::consolePinSource(NVVidMemory *owner, void *device, UInt64 bytes, NvConsoleSourcePin *pin)
++{
++    if (!pin) return false;
++    *pin = {};
++    if (!owner || !device || !bytes || !fConsoleLock) return false;
++    IOLockLock(fConsoleLock);
++    if (!fConsoleAllocationsClosed && device == fConsoleDevice &&
++        __atomic_load_n(&owner->fConsoleAllocator, __ATOMIC_ACQUIRE) == this) {
++        for (NvConsoleAllocation *r = fConsoleAllocations; r; r = r->next) {
++            if (!r->ownerBound || r->owner != owner || r->retiring || r->parked || r->device != device ||
++                !r->memory.handle || !r->memory.allocationCookie || !r->memory.actualSize ||
++                bytes > r->memory.actualSize || r->pins == UINT64_MAX) continue;
++            ++r->pins; pin->record = r; pin->memory = r->memory; pin->device = r->device;
++            break;
++        }
++    }
++    IOLockUnlock(fConsoleLock);
++    // Identity comes from the protected owner-bound record, never from racing loads of the VM's fields.
++    return pin->record != nullptr;
++}
++
++void NVAccel::consoleUnpinSource(NvConsoleSourcePin *pin)
++{
++    if (!pin || !pin->record || !fConsoleLock) return;
++    IOLockLock(fConsoleLock);
++    for (NvConsoleAllocation *r = fConsoleAllocations; r; r = r->next) {
++        if (r != pin->record) continue;
++        if (r->pins && r->device == pin->device && r->memory.handle == pin->memory.handle &&
++            r->memory.allocationCookie == pin->memory.allocationCookie) --r->pins;
++        break;
++    }
++    *pin = {};
++    const unsigned releases = consoleReapLocked();
++    IOLockUnlock(fConsoleLock);
++    // Never unpin while holding the copy or publication locks.
++    for (unsigned i = 0; i < releases; ++i) release();
++}
++
++void NVAccel::consoleCloseAllocations()
++{
++    if (!fConsoleLock) return;
++    IOLockLock(fConsoleLock);
++    fConsoleAllocationsClosed = true;
++    // Owner-bound records stay for their VMs; only an explicit owner release retires them.
++    const unsigned releases = fConsoleKms ? consoleReapLocked() : 0;
++    IOLockUnlock(fConsoleLock);
++    for (unsigned i = 0; i < releases; ++i) release();
++}
++// END HYPERV-CARRY
++
+ IOAccelMemory *NVDisplayPipe::initFramebufferResource(unsigned int index, IOAccelResource2 *res)
+ {
+     if (!gNvScanout) {
+@@ -681,8 +1135,18 @@ IOAccelMemory *NVDisplayPipe::initFramebufferResource(unsigned int index, IOAcce
+     struct NVRMVramRequest r;
+     for (unsigned i = 0; i < sizeof r; i++) ((volatile unsigned char *)&r)[i] = 0;
+     r.version = NVRM_VRAM_ABI_VERSION;
+-    IOReturn ret = a->askFramebufferForScanout(&r, fb);
+-    if (ret == kIOReturnSuccess && r.kva && !r.phys) {
++    // HYPERV-CARRY: a private-publication console never exposes its aperture; its geometry comes from Describe.
++    const bool privatePublication = nvPrivatePublication(fb);
++    IOReturn ret;
++    if (privatePublication) {
++        HPReply description = {};
++        ret = nvPublicationDescribe(fb, &description) ? kIOReturnSuccess : kIOReturnNotReady;
++        if (ret == kIOReturnSuccess) {
++            r.width = description.geometry.width; r.height = description.geometry.height;
++            r.pitch = static_cast<UInt32>(description.geometry.aperturePitch); r.actualSize = uint64_t(r.pitch) * r.height;
++        }
++    } else ret = a->askFramebufferForScanout(&r, fb);
++    if (!privatePublication && ret == kIOReturnSuccess && r.kva && !r.phys) {
+         // Another GPU's panel (NMIntelFB on a laptop without a MUX): its scanout is Intel memory with a CPU mapping and
+         // no NVIDIA VRAM address. No vidmem may stand for it (addToAperture/getApertureMemoryDescriptor would hand
+         // BAR1 offset 0 to the GPU), and none may be allocated in its place (fresh VRAM mapped here is the 10-10
+@@ -692,7 +1156,7 @@ IOAccelMemory *NVDisplayPipe::initFramebufferResource(unsigned int index, IOAcce
+              "panel) -- no framebuffer resource, frames are copied", head, index, r.width, r.height, r.pitch);
+         return nullptr;
+     }
+-    if (ret != kIOReturnSuccess || !r.phys || !r.actualSize) {
++    if (ret != kIOReturnSuccess || (!privatePublication && !r.phys) || !r.actualSize) {
+         ALOG("NVDisplayPipe::initFramebufferResource: framebuffer would not describe its scanout (0x%x)", (unsigned)ret);
+         return nullptr;
+     }
+@@ -704,6 +1168,12 @@ IOAccelMemory *NVDisplayPipe::initFramebufferResource(unsigned int index, IOAcce
+         if (o) o->release();
+         return nullptr;
+     }
++    if (nvConsoleFramebuffer(fb)) {
++        // HYPERV-CARRY: the GPU renders into a real NVIDIA allocation (console KAPI VRAM, see allocPhysical). The
++        // Hyper-V aperture is only a copy destination; never map it as GPU video memory.
++        ALOG("Hyper-V framebuffer resource uses NVIDIA staging memory (%llu bytes)", (unsigned long long)r.actualSize);
++        return (IOAccelMemory *)m;
++    }
+     m->fScanout = true;
+     m->fPhys    = r.phys;
+     m->fBytes   = r.actualSize;
+@@ -773,8 +1243,50 @@ void NVResource::free()
+ static int gVmSticky = 1;
+ static SInt64 gCntVmParked, gCntVmUnparked, gCntVmParkReleased;
+ 
++// BEGIN HYPERV-CARRY: binding lifetime of console-managed VRAM. Every alloc/dealloc of every VM takes its binding lock
++// before choosing a route, so a deallocation that entered before the first managed bind finishes before that bind.
++class NvConsoleBindingGuard {
++    IOLock *lock;
++public:
++    explicit NvConsoleBindingGuard(IOLock *value) : lock(value) { IOLockLock(lock); }
++    ~NvConsoleBindingGuard() { unlock(); }
++    void unlock() { if (lock) { IOLockUnlock(lock); lock = nullptr; } }
++    NvConsoleBindingGuard(const NvConsoleBindingGuard &) = delete;
++    NvConsoleBindingGuard &operator=(const NvConsoleBindingGuard &) = delete;
++};
++IOLock *NVVidMemory::consoleBindingLock()
++{
++    IOLock *lock = __atomic_load_n(&fConsoleBindingLock, __ATOMIC_ACQUIRE);
++    if (!lock) {
++        IOLock *created = IOLockAlloc();
++        if (!created) return nullptr;
++        IOLock *expected = nullptr;
++        if (!__atomic_compare_exchange_n(&fConsoleBindingLock, &expected, created, false,
++                                         __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) IOLockFree(created);
++        lock = __atomic_load_n(&fConsoleBindingLock, __ATOMIC_ACQUIRE);
++    }
++    return lock;
++}
++// Caller holds the binding lock. Gives the VM's console record (active or parked) back and returns the allocator whose
++// binding retain the caller must release AFTER dropping the binding lock (nullptr: nothing was bound).
++NVAccel *NVVidMemory::consoleDetachLocked(unsigned long long *bytes)
++{
++    NVAccel *bound = __atomic_exchange_n(&fConsoleAllocator, static_cast<NVAccel *>(nullptr), __ATOMIC_ACQ_REL);
++    if (bytes) *bytes = 0;
++    if (!bound) return nullptr;
++    NVRMVramRequest released = {};
++    bound->consoleReleaseOwner(this, &released);
++    if (bytes) *bytes = released.actualSize;
++    *(volatile unsigned long long *)((unsigned char *)this + 0xc8) = 0;
++    return bound;
++}
++// END HYPERV-CARRY
++
+ bool NVVidMemory::allocPhysical()
+ {
++    IOLock *binding = consoleBindingLock();   // HYPERV-CARRY
++    if (!binding) return false;
++    NvConsoleBindingGuard bindingGuard(binding);
+     if (fScanout) {
+         if (!fPhys || !fBytes) { ALOG("NVVidMemory::allocPhysical(%p): scanout with no address", this); return false; }
+         *(volatile unsigned long long *)((unsigned char *)this + 0xc8) = fPhys;
+@@ -790,6 +1302,37 @@ bool NVVidMemory::allocPhysical()
+     const unsigned long long want = *(const volatile unsigned long long *)((const unsigned char *)this + 0x40);
+     if (!want) { ALOG("NVVidMemory::allocPhysical(%p): length at +0x40 is 0 -- nothing to back", this); return false; }
+     if (!NVAccel::gAccel) { ALOG("NVVidMemory::allocPhysical(%p): no accelerator", this); return false; }
++    // BEGIN HYPERV-CARRY: console-managed VRAM (the head is the Hyper-V console, so there is no NVRMFB to ask).
++    if (NVAccel *bound = __atomic_load_n(&fConsoleAllocator, __ATOMIC_ACQUIRE)) {
++        // #200 for the console route: hand back the VRAM this VM parked, same allocation and cookie.
++        const IOReturn unparked = bound->consoleUnparkOwner(this, want);
++        if (unparked == kIOReturnSuccess) {
++            *(volatile unsigned long long *)((unsigned char *)this + 0xc8) = fPhys;
++            OSAddAtomic64(1, &gCntVmUnparked);
++            return true;
++        }
++        // The resource grew (or the record is gone): give the old allocation back before taking a new one. The binding
++        // retain is not the accelerator's last reference (the registry holds it, and NVAccel::free never touches a VM),
++        // so it is released here, under this VM's binding lock.
++        unsigned long long bytes = 0;
++        if (NVAccel *dropped = consoleDetachLocked(&bytes)) {
++            if (unparked == kIOReturnNoSpace) OSAddAtomic64(1, &gCntVmParkReleased);
++            dropped->release();
++        }
++    }
++    if (nvConsoleFramebuffer(NVAccel::gAccel->fFB)) {
++        NVRMVramRequest request = {};
++        request.version = NVRM_VRAM_ABI_VERSION;
++        request.size = want;
++        __atomic_store_n(&fConsoleManaged, 1u, __ATOMIC_RELEASE);   // sticky: this VM never takes the NVRMFB route
++        const IOReturn result = NVAccel::gAccel->consoleAllocateOwner(this, &request);
++        if (result != kIOReturnSuccess) { OSAddAtomic64(1, &gCntVmRefused); return false; }
++        *(volatile unsigned long long *)((unsigned char *)this + 0xc8) = request.phys;
++        OSAddAtomic64(1, &gCntVmAlloc); OSAddAtomic64(static_cast<SInt64>(request.actualSize), &gCntVmAllocBytes);
++        return true;
++    }
++    if (__atomic_load_n(&fConsoleManaged, __ATOMIC_ACQUIRE)) return false;
++    // END HYPERV-CARRY
+     if (fParkHandle) {
+         if (fParkBytes >= want) {
+             fRmHandle = fParkHandle; fKva = fParkKva; fPhys = fParkPhys; fBytes = fParkBytes; fAllocationCookie = fParkCookie;
+@@ -822,6 +1365,26 @@ bool NVVidMemory::allocPhysical()
+ 
+ void NVVidMemory::deallocPhysical()
+ {
++    // BEGIN HYPERV-CARRY: even a never-managed VM takes the binding lock before choosing a route. A failed lock
++    // allocation is fail-closed: nothing is freed and no identity is cleared.
++    IOLock *binding = consoleBindingLock();
++    if (!binding) return;
++    NvConsoleBindingGuard bindingGuard(binding);
++    if (__atomic_load_n(&fConsoleManaged, __ATOMIC_ACQUIRE)) {
++        NVAccel *bound = __atomic_load_n(&fConsoleAllocator, __ATOMIC_ACQUIRE);
++        if (!bound || !fRmHandle) return;   // nothing active: already parked or given back; never raw-free a record
++        OSAddAtomic64(1, &gCntVmDealloc); OSAddAtomic64((SInt64)fBytes, &gCntVmDeallocBytes);
++        if (gVmSticky && bound->consoleParkOwner(this)) {
++            *(volatile unsigned long long *)((unsigned char *)this + 0xc8) = 0;
++            OSAddAtomic64(1, &gCntVmParked);
++            return;
++        }
++        NVAccel *dropped = consoleDetachLocked(nullptr);
++        bindingGuard.unlock();
++        if (dropped) dropped->release();   // the binding retain, after the binding lock
++        return;
++    }
++    // END HYPERV-CARRY
+     if (fScanout) {
+         ALOG("NVVidMemory::deallocPhysical(%p): SCANOUT -- not ours to free, only forgetting it", this);
+         fPhys = 0; fBytes = 0; fScanout = false;
+@@ -865,12 +1428,45 @@ void NVVidMemory::releaseParked()
+ 
+ void NVVidMemory::free()
+ {
+-    if (fRmHandle && !fScanout) {
+-        releaseVram(fRmHandle, fKva, fBytes, fAllocationCookie);
+-        fRmHandle = nullptr; fKva = nullptr; fPhys = 0; fBytes = 0; fAllocationCookie = 0;
++    // HYPERV-CARRY: a console-managed VM gives its record (active or parked) back through its own binding, never through
++    // askFramebufferForVram and never by parking. Final release means no alloc/dealloc can still be inside this VM.
++    if (__atomic_load_n(&fConsoleManaged, __ATOMIC_ACQUIRE)) {
++        NVAccel *dropped = nullptr;
++        if (IOLock *binding = __atomic_load_n(&fConsoleBindingLock, __ATOMIC_ACQUIRE)) {
++            NvConsoleBindingGuard bindingGuard(binding);
++            dropped = consoleDetachLocked(nullptr);
++        }
++        if (dropped) dropped->release();
++    } else {
++        if (fRmHandle && !fScanout) {
++            releaseVram(fRmHandle, fKva, fBytes, fAllocationCookie);
++            fRmHandle = nullptr; fKva = nullptr; fPhys = 0; fBytes = 0; fAllocationCookie = 0;
++        }
++        releaseParked();
+     }
+-    releaseParked();
++    IOLock *binding = __atomic_exchange_n(&fConsoleBindingLock, static_cast<IOLock *>(nullptr), __ATOMIC_ACQ_REL);
+     IOAccelVidMemory::free();
++    if (binding) IOLockFree(binding);
++}
++
++// HYPERV-CARRY (generic, not upstream): when a surface becomes volatile the family later purges its device cache by
++// clearing the resource's validity words (and the 0x8000 flag it sets makes requirePageoff() false), so a frame that
++// existed only in VRAM was lost and its owner, seeing system memory intact, never redrew it (menu-bar items blank after a
++// mode change). The family asks the vidmem first, so page VRAM-only contents back while they are still current.
++static SInt64 gCntVolatileSync, gCntVolatileSyncFail;
++IOReturn NVVidMemory::setPurgeable(unsigned int newState, unsigned int *oldState)
++{
++    if (newState == kIOMemoryPurgeableVolatile && fRmHandle && !fScanout) {
++        // IOAccelVidMemory::init stores the owning resource at +0x38.
++        NVResource *res = OSDynamicCast(NVResource, *(OSObject *volatile *)((unsigned char *)this + 0x38));
++        volatile unsigned short *valid = res ? *(unsigned short *volatile *)((volatile unsigned char *)res + 0x30) : nullptr;
++        if (res && nvres_vidmem(res) == this && valid && (valid[6] & ~valid[0] & 1u)) {
++            bool ok = false;
++            res->pageoff(nullptr, true, &ok, 0);   // takes no family lock itself: safe under the caller's
++            OSAddAtomic64(1, ok ? &gCntVolatileSync : &gCntVolatileSyncFail);
++        }
++    }
++    return IOAccelVidMemory::setPurgeable(newState, oldState);
+ }
+ 
+ class IOSurface {
+@@ -888,8 +1484,7 @@ public:
+     OSObject  *getPlaneResource(unsigned int, unsigned int) const;
+ };
+ 
+-static int    gNvIop = 0;
+-static SInt64 gCntIopOk, gCntIopFail, gCntIopEmpty, gCntIopSrcRes, gCntIopSrcSurf, gCntIopBlank;
++static SInt64 gCntIopOk, gCntIopFail, gCntIopEmpty, gCntIopSrcRes, gCntIopSrcSurf, gCntIopBlank, gCntIopVramSync;
+ static SInt64 gCntIopOkHead[kNvMaxFB];
+ #define NVIOP_LOG_MAX 40
+ static unsigned gIopLogs = 0;
+@@ -946,6 +1541,19 @@ static bool nvAccelSurfCopyReady(IOSurface *s, unsigned head);
+ static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pipe);
+ static bool nvSurfWaitReady(unsigned int id);
+ static void nvAccelIopHome(IOService *fb, unsigned head);
++// BEGIN HYPERV-CARRY
++static bool nvConsoleDirectPresent(NVAccel *a, IOService *fb, NVVidMemory *vm, unsigned w, unsigned h, unsigned pitch);
++// Wake the host's reader for a frame already in the (non-private) Hyper-V aperture. Only the Hyper-V console.
++static void nvConsolePresent(IOService *fb, unsigned w, unsigned h)
++{
++    if (!nvConsoleFramebuffer(fb) || nvPrivatePublication(fb)) return;
++    HyperVGraphicsPresent p = {w, h, 0, 0, w, h};
++    OSSynchronizeIO();   // publish the pixels (and drain write-combining CPU stores) before the notification
++    IOReturn status = fb->callPlatformFunction(kHyperVGraphicsPlatformFunctionPresent,
++        false, &p, reinterpret_cast<void *>(sizeof(p)), nullptr, nullptr);
++    OSAddAtomic64(1, status == kIOReturnSuccess ? &gCntConsolePresent : &gCntConsolePresentRefused);
++}
++// END HYPERV-CARRY
+ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
+ {
+     if (!gNvIop) return (IOReturn)0xe00002c7;
+@@ -974,6 +1582,31 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
+              res ? *(const volatile unsigned int *)(kr + 0xb8) : 0u, res ? *(const volatile unsigned int *)(kr + 0xc0) : 0u,
+              vm ? (unsigned long long)vm->fBytes : 0ull, (vm && vm->fKva) ? 1 : 0, vm ? (int)vm->fScanout : -1);
+     }
++    // BEGIN HYPERV-CARRY: a composited surface whose newest pixels are in VRAM goes to the Hyper-V console on the GPU
++    // copy engine. Since 2.1 (#196) WindowServer no longer waits for its composite on the GPU, so wait for this
++    // surface's completion mark first, as upstream's copy and flip paths do, or the engine copies an unfinished frame.
++    // Presenting is not a page-off into system RAM: the IOSurface validity words are left alone.
++    const bool console = nvConsoleFramebuffer(fb);
++    volatile unsigned short *valid = res ? *(unsigned short *volatile *)((volatile unsigned char *)res + 0x30) : nullptr;
++    if (console && s && vm && !vm->fScanout && valid && (valid[6] & 1u) && gConsoleDirectMode && !gConsoleDirectFailed &&
++        s->getPixelFormat() == 0x42475241u && s->getWidth() && s->getHeight() && s->getWidth() <= 16384 &&
++        s->getHeight() <= 16384 && s->getBytesPerRow() <= 16384ull * 8) {
++        const unsigned sw = (unsigned)s->getWidth(), sh = (unsigned)s->getHeight(), sp = (unsigned)s->getBytesPerRow();
++        nvSurfWaitReady(s->getSurfaceID());
++        if (nvPrivatePublication(fb)) {
++            const IOReturn published = nvPublicationProduce(a, fb, vm, sw, sh, sp);
++            if (published == kIOReturnSuccess) {
++                OSAddAtomic64(1, &gCntIopSrcSurf); OSAddAtomic64(1, &gCntIopOk); OSAddAtomic64(1, &gCntIopOkHead[head]);
++            }
++            // A stale mode/owner is a dropped old transaction, never a second writer.
++            return published == kIOReturnNotReady ? kIOReturnSuccess : published;
++        }
++        if (vm->fRmHandle && nvConsoleDirectPresent(a, fb, vm, sw, sh, sp)) {
++            OSAddAtomic64(1, &gCntIopSrcSurf); OSAddAtomic64(1, &gCntIopOk); OSAddAtomic64(1, &gCntIopOkHead[head]);
++            return kIOReturnSuccess;
++        }
++    }
++    // END HYPERV-CARRY
+     if (!s && vm && vm->fKva) {
+         const unsigned char *rr = (const unsigned char *)res;
+         w     = *(const volatile unsigned short *)(rr + 0xb0);
+@@ -991,7 +1624,17 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
+         // (1.13-1.14.1), nvaccel_iop_blank about half of every copied frame, never on machines whose frames all flip.
+         // Such a frame now keeps the previous picture on the panel instead.
+         nvSurfWaitReady(s->getSurfaceID());   // a copied frame is read here, so its GPU work must be done first
+-        if (!nvAccelSurfCopyReady(s, head)) return kIOReturnSuccess;
++        if (console) {
++            // HYPERV-CARRY (CPU fallback to the console): transactions run with the accelerator lock held, so a lookup
++            // that takes it (nvAccelSurfCopyReady/ScanoutSync) cannot; the transaction already names this plane's
++            // resource, so page its VRAM off on the copy engine directly (pageoff takes no family lock).
++            bool synced = false;
++            if (vm && vm->fRmHandle && !vm->fScanout && valid && (valid[6] & 1u)) {
++                res->pageoff(nullptr, true, &synced, 0);
++                if (synced) OSAddAtomic64(1, &gCntIopVramSync);
++            }
++            if (!synced) nvAccelSurfScanoutSync(s);   // try-lock only: never blocks on a lock this thread may hold
++        } else if (!nvAccelSurfCopyReady(s, head)) return kIOReturnSuccess;
+         const unsigned fmt = s->getPixelFormat();
+         if (fmt != 0x42475241u) NVIOP_FAIL(kIOReturnUnsupported, "surface 0x%x format 0x%08x is not BGRA", s->getSurfaceID(), fmt);
+         const unsigned long long W = s->getWidth(), H = s->getHeight(), P = s->getBytesPerRow();
+@@ -1006,6 +1649,19 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
+         NVIOP_FAIL(kIOReturnUnsupported, "plane resource %p is not an NVResource with a CPU mapping, and there is no IOSurface", ro);
+     }
+     if (!w || !h || pitch < 4) NVIOP_FAIL(kIOReturnBadArgument, "source geometry %ux%u pitch %u", w, h, pitch);
++    if (console && nvPrivatePublication(fb)) {
++        // HYPERV-CARRY: the private console takes every frame through the publication ABI, never a raw aperture write.
++        if (!s && vm && vm->fRmHandle && valid && (valid[6] & 1u) && gConsoleDirectMode && !gConsoleDirectFailed) {
++            const IOReturn published = nvPublicationProduce(a, fb, vm, w, h, pitch);
++            if (published == kIOReturnSuccess) { OSAddAtomic64(1, &gCntIopSrcRes); OSAddAtomic64(1, &gCntIopOk); OSAddAtomic64(1, &gCntIopOkHead[head]); }
++            return published == kIOReturnNotReady ? kIOReturnSuccess : published;
++        }
++        const IOReturn published = nvPublicationCPU(fb, const_cast<const unsigned int *>(src), uint64_t(pitch) * h, w, h, pitch);
++        if (published == kIOReturnSuccess) {
++            OSAddAtomic64(1, &gCntIopCpuCopies); OSAddAtomic64(1, &gCntIopOk); OSAddAtomic64(1, &gCntIopOkHead[head]);
++        }
++        return published == kIOReturnNotReady ? kIOReturnSuccess : published;
++    }
+ 
+     struct NVRMVramRequest q;
+     for (unsigned i = 0; i < sizeof q; i++) ((volatile unsigned char *)&q)[i] = 0;
+@@ -1024,6 +1680,7 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
+         for (unsigned x = 0; x < words; x++) dp[x] = sp[x];
+     }
+     OSAddAtomic64(1, fromRes ? &gCntIopSrcRes : &gCntIopSrcSurf);
++    if (console) { nvConsolePresent(fb, w, h); OSAddAtomic64(1, &gCntIopCpuCopies); }   // HYPERV-CARRY
+     const SInt64 n = OSAddAtomic64(1, &gCntIopOk);
+     const SInt64 nh = OSAddAtomic64(1, &gCntIopOkHead[head]);
+     unsigned nz = 0, varied = 0; const unsigned first = src[0] & 0xffffffu;
+@@ -1115,6 +1772,20 @@ NVACCEL_CNT(nvaccel_iop_src_surf,     gCntIopSrcSurf,     "K3: frames sourced fr
+ NVACCEL_CNT(nvaccel_iop_blank,        gCntIopBlank,       "K6: frames copied whose 64 samples were all ONE colour (a blank frame)");
+ static SInt64 gCntIopCopySkip;
+ NVACCEL_CNT(nvaccel_iop_copy_skip,    gCntIopCopySkip,    "frames kept on the panel because the surface's newest pixels were not yet in system memory");
++// BEGIN HYPERV-CARRY
++SYSCTL_INT(_debug, OID_AUTO, nvaccel_console_direct, CTLFLAG_RW | CTLFLAG_LOCKED, &gConsoleDirectMode, 0,
++           "Hyper-V console: 1 = GPU copy-engine frames (default), 0 = CPU copies only");
++NVACCEL_CNT(nvaccel_console_direct_frames,  gCntConsoleDirect,         "Hyper-V console frames written by the GPU copy engine");
++NVACCEL_CNT(nvaccel_console_direct_refused, gCntConsoleDirectRefused,  "Hyper-V console GPU frames refused (CPU fallback afterwards on a GPU error)");
++NVACCEL_CNT(nvaccel_console_dma_refused,    gCntConsoleDmaRefused,     "Hyper-V console copy-engine submissions that failed");
++NVACCEL_CNT(nvaccel_console_present,        gCntConsolePresent,        "Hyper-V frame notifications");
++NVACCEL_CNT(nvaccel_console_present_refused, gCntConsolePresentRefused, "Hyper-V notifications refused (host refresh timer instead)");
++NVACCEL_CNT(nvaccel_publication_stale,      gCntPublicationStale,      "Hyper-V publication: stale mode/owner frames dropped (never a second writer)");
++NVACCEL_CNT(nvaccel_iop_cpu_copies,         gCntIopCpuCopies,          "Hyper-V console frames using the CPU copy fallback");
++NVACCEL_CNT(nvaccel_iop_vram_sync,          gCntIopVramSync,           "Hyper-V console CPU-fallback frames paged off VRAM first");
++NVACCEL_CNT(nvaccel_volatile_sync,          gCntVolatileSync,          "VRAM-only surfaces paged off when they became volatile");
++NVACCEL_CNT(nvaccel_volatile_sync_fail,     gCntVolatileSyncFail,      "VRAM-only surfaces whose page-off on becoming volatile failed");
++// END HYPERV-CARRY
+ static int    gIopFlip = 0;
+ static SInt64 gCntIopFlip, gCntIopFlipHome, gCntIopFlipNo[8];
+ SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_flip, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &gIopFlip, 0, "1 = scan the composited IOSurface out of its own VRAM (no copy)");
+@@ -1237,6 +1908,14 @@ static void nvaccelInstallSysctl(void)
+     sysctl_register_oid(&sysctl__debug_nvaccel_iop_empty);
+     sysctl_register_oid(&sysctl__debug_nvaccel_iop_src_res);    sysctl_register_oid(&sysctl__debug_nvaccel_iop_src_surf);
+     sysctl_register_oid(&sysctl__debug_nvaccel_iop_blank);      sysctl_register_oid(&sysctl__debug_nvaccel_iop_copy_skip);
++    // HYPERV-CARRY
++    sysctl_register_oid(&sysctl__debug_nvaccel_console_direct);
++    sysctl_register_oid(&sysctl__debug_nvaccel_console_direct_frames); sysctl_register_oid(&sysctl__debug_nvaccel_console_direct_refused);
++    sysctl_register_oid(&sysctl__debug_nvaccel_console_dma_refused);
++    sysctl_register_oid(&sysctl__debug_nvaccel_console_present); sysctl_register_oid(&sysctl__debug_nvaccel_console_present_refused);
++    sysctl_register_oid(&sysctl__debug_nvaccel_publication_stale); sysctl_register_oid(&sysctl__debug_nvaccel_iop_cpu_copies);
++    sysctl_register_oid(&sysctl__debug_nvaccel_iop_vram_sync);
++    sysctl_register_oid(&sysctl__debug_nvaccel_volatile_sync); sysctl_register_oid(&sysctl__debug_nvaccel_volatile_sync_fail);
+     sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip);       sysctl_register_oid(&sysctl__debug_nvaccel_iop_flips);
+     sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_home);  sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_lock);
+     sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_novram); sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_stale);
+@@ -1289,7 +1968,18 @@ static bool nvAccelRmHandles(struct NVRMRmHandles *out)
+     struct NVRMRmHandles h;
+     nvAccelZero(&h, sizeof h);
+     h.version = NVRM_GPUVA_ABI_VERSION;
+-    IOReturn r = a->fFB->callPlatformFunction(sym, false, &h, nullptr, nullptr, nullptr);
++    IOReturn r;
++    if (nvConsoleFramebuffer(a->fFB)) {
++        // HYPERV-CARRY: no NVRMFB to ask; GPU VA, sharing and page-off all use NVAccel's own KAPI device.
++        if (!a->fConsoleLock) r = kIOReturnNotReady;
++        else {
++            IOLockLock(a->fConsoleLock);
++            const bool ready = a->consoleDeviceReady();
++            if (ready) h.kapiDevice = a->fConsoleDevice;
++            IOLockUnlock(a->fConsoleLock);
++            r = ready ? kIOReturnSuccess : kIOReturnNotReady;
++        }
++    } else r = a->fFB->callPlatformFunction(sym, false, &h, nullptr, nullptr, nullptr);
+     sym->release();
+     if (r != kIOReturnSuccess || !h.kapiDevice) {
+         if (nvRmHandlesLogged < 8) { nvRmHandlesLogged++;
+@@ -2057,6 +2747,505 @@ void nvAccelSwapProbe(IOAccelResource2 *a1, IOAccelResource2 *a2)
+ static unsigned nvFlipWhy = 0;
+ #define NVFLIPWHY(...) do { if (nvFlipWhy < 20) { nvFlipWhy++; ALOG(__VA_ARGS__); } } while (0)
+ 
++// BEGIN HYPERV-CARRY: completed-frame staging pool ("S") for the private publication console. One 32 MiB wired RAM pool,
++// prepared once at start. Each accelerated frame is ONE copy-engine page-off of the pinned source VRAM into S; the
++// framebuffer then composes changed rows from S into its private aperture. The stage lock is short and is never held
++// across RM, the consumer, allocation, or the copy lock.
++enum {
++    kNvStagePages = 8192, kNvStageMaxChunks = 128, kNvStageRunLimit = 128,
++    kNvStageNoBuffer = 1, kNvStagePrepareFailed = 2, kNvStageNoMetadata = 3,
++    kNvStageBadPage = 4, kNvStageFragmented = 5, kNvStageTooManyRuns = 6,
++    kNvStageMapFailed = 7, kNvStageMapMismatch = 8
++};
++static const UInt64 kNvStageCapacity = 32ull << 20;
++static const UInt64 kNvStageChunkBytes = 256ull << 10;
++static const UInt64 kNvStageLargeChunkBytes = 1ull << 20;
++static_assert(PAGE_SIZE == 4096 && kNvStageMaxChunks * kNvStageChunkBytes == kNvStageCapacity &&
++              kNvStagePages * PAGE_SIZE == kNvStageCapacity, "staging pool requires x86_64 4 KiB pages");
++struct NvStagePreparation {
++    UInt64 verifiedPages, rawRuns, lastPage;
++    UInt32 reason, chunkCount;
++};
++struct NvStageChunk {
++    IOBufferMemoryDescriptor *buffer;
++    const UInt32 *words;
++    UInt64 bytes;
++    bool prepared;
++};
++struct NvStageStorage {
++    NvStageChunk chunks[kNvStageMaxChunks];
++    unsigned long long *pages;
++    const OSSymbol *symbol;
++    UInt32 chunkCount;
++    IOAddressRange ranges[kNvStageRunLimit];
++    IOMemoryDescriptor *aliasDescriptor;
++    IOMemoryMap *aliasMap;
++    const UInt32 *aliasWords;
++    bool aliasPrepared;
++};
++static IOLock *gNvStageLock;
++static NVAccel *gNvStageOwner;   // borrowed, only under the stage lock; stop removes it
++static bool gNvStageClosed;
++
++static void nvStageDisposeChunks(NvStageStorage *s)
++{
++    for (UInt32 i = 0; i < s->chunkCount; ++i) {
++        NvStageChunk &c = s->chunks[i];
++        if (c.buffer) {
++            if (c.prepared) c.buffer->complete();
++            c.buffer->release();
++        }
++        c = {};
++    }
++    s->chunkCount = 0;
++}
++// Control/stop only, outside both locks. Never called on storage a failed submission may still reference.
++static void nvStageDispose(NvStageStorage *s)
++{
++    if (!s) return;
++    if (s->aliasMap) s->aliasMap->release();   // unmap the CPU alias before its descriptor and the chunks
++    if (s->aliasDescriptor) {
++        if (s->aliasPrepared) s->aliasDescriptor->complete();
++        s->aliasDescriptor->release();
++    }
++    nvStageDisposeChunks(s);
++    if (s->symbol) s->symbol->release();
++    if (s->pages) IOFree(s->pages, kNvStagePages * sizeof(*s->pages));
++    IOFree(s, sizeof(*s));
++}
++static bool nvStageCheckPage(NvStagePreparation *p, UInt64 i, UInt64 physical, UInt64 segment)
++{
++    if (!physical || (physical & (PAGE_SIZE - 1)) || segment < PAGE_SIZE || physical > ~UInt64(0) - (PAGE_SIZE - 1)) {
++        p->reason = kNvStageBadPage;
++        return false;
++    }
++    if (!i) p->rawRuns = 1;
++    else if (p->lastPage > ~UInt64(0) - PAGE_SIZE || physical != p->lastPage + PAGE_SIZE) ++p->rawRuns;
++    p->lastPage = physical; ++p->verifiedPages;
++    return true;
++}
++static int nvStageAllocateChunk(NvStageStorage *s, NvStagePreparation *p, UInt64 bytes, bool contiguous)
++{
++    if (s->chunkCount >= kNvStageMaxChunks || p->verifiedPages + bytes / PAGE_SIZE > kNvStagePages) {
++        p->reason = kNvStageNoMetadata; return EINVAL;
++    }
++    const UInt32 index = s->chunkCount++;
++    NvStageChunk &c = s->chunks[index];
++    const IOOptionBits options = kIODirectionInOut | kIOMapCopybackCache | (contiguous ? kIOMemoryPhysicallyContiguous : 0);
++    c.buffer = IOBufferMemoryDescriptor::withOptions(options, bytes, PAGE_SIZE);
++    if (!c.buffer) { p->reason = kNvStageNoBuffer; return ENOMEM; }
++    if (c.buffer->prepare() != kIOReturnSuccess) { p->reason = kNvStagePrepareFailed; return EIO; }
++    c.prepared = true;
++    c.words = static_cast<const UInt32 *>(c.buffer->getBytesNoCopy());
++    c.bytes = bytes;
++    if (c.buffer->getLength() < bytes || !c.words) { p->reason = kNvStageNoBuffer; return ENOMEM; }
++    const UInt64 first = p->verifiedPages;
++    for (UInt64 off = 0; off < bytes; off += PAGE_SIZE) {
++        IOByteCount segment = 0;
++        const addr64_t phys = c.buffer->getPhysicalSegment(off, &segment, kIOMemoryMapperNone);
++        const UInt64 i = first + off / PAGE_SIZE;
++        if (!nvStageCheckPage(p, i, phys, segment)) return EINVAL;
++        if (contiguous && off && (s->pages[i - 1] > ~UInt64(0) - PAGE_SIZE || phys != s->pages[i - 1] + PAGE_SIZE)) {
++            p->reason = kNvStageFragmented;
++            return EINVAL;
++        }
++        s->pages[i] = phys;   // independently observed physical byte addresses
++    }
++    p->chunkCount = s->chunkCount;
++    return 0;
++}
++// A CPU-only write-back alias over the verified RAM pages, so the consumer sees one contiguous view. Never aliases
++// device or write-combining aperture memory.
++static int nvStageMapChunks(NvStageStorage *s, NvStagePreparation *p)
++{
++    UInt32 count = 0;
++    for (UInt64 i = 0; i < kNvStagePages; ++i) {
++        const UInt64 physical = s->pages[i];
++        if (!physical || (physical & (PAGE_SIZE - 1)) || physical > ~UInt64(0) - PAGE_SIZE) {
++            p->reason = kNvStageBadPage; return EINVAL;
++        }
++        if (i && s->pages[i - 1] <= ~UInt64(0) - PAGE_SIZE && physical == s->pages[i - 1] + PAGE_SIZE) {
++            s->ranges[count - 1].length += PAGE_SIZE;
++        } else {
++            if (count >= kNvStageRunLimit) { p->reason = kNvStageTooManyRuns; return EINVAL; }
++            s->ranges[count].address = physical;
++            s->ranges[count++].length = PAGE_SIZE;
++        }
++    }
++    const IOOptionBits mdOptions = kIOMemoryTypePhysical64 | kIODirectionInOut | kIOMemoryMapperNone | kIOMemoryHostOnly;
++    s->aliasDescriptor = IOMemoryDescriptor::withOptions(s->ranges, count, 0, nullptr, mdOptions);
++    if (!s->aliasDescriptor) { p->reason = kNvStageMapFailed; return ENOMEM; }
++    if (s->aliasDescriptor->prepare() != kIOReturnSuccess) { p->reason = kNvStageMapFailed; return EIO; }
++    s->aliasPrepared = true;
++    if (s->aliasDescriptor->getLength() != kNvStageCapacity) { p->reason = kNvStageMapMismatch; return EINVAL; }
++    for (UInt64 i = 0; i < kNvStagePages; ++i) {   // round-trip the descriptor's page list before any CPU map
++        IOByteCount segment = 0;
++        const addr64_t physical = s->aliasDescriptor->getPhysicalSegment(i * PAGE_SIZE, &segment, kIOMemoryMapperNone);
++        if (physical != s->pages[i] || segment < PAGE_SIZE) { p->reason = kNvStageMapMismatch; return EINVAL; }
++    }
++    s->aliasMap = s->aliasDescriptor->map(kIOMapCopybackCache | kIOMapReadOnly);
++    if (!s->aliasMap || s->aliasMap->getLength() != kNvStageCapacity || !s->aliasMap->getVirtualAddress() ||
++        (s->aliasMap->getMapOptions() & kIOMapCacheMask) != kIOMapCopybackCache) {
++        p->reason = kNvStageMapFailed; return ENOMEM;
++    }
++    s->aliasWords = reinterpret_cast<const UInt32 *>(s->aliasMap->getVirtualAddress());
++    return 0;
++}
++static void nvStageResetPreparation(NvStageStorage *s, NvStagePreparation *p)
++{
++    nvStageDisposeChunks(s);
++    *p = {};
++}
++static int nvStagePrepare(NvStageStorage *s, NvStagePreparation *p)
++{
++    s->pages = static_cast<unsigned long long *>(IOMalloc(kNvStagePages * sizeof(*s->pages)));
++    s->symbol = OSSymbol::withCStringNoCopy(NVRM_SS_FN_PAGEOFF);
++    if (!s->pages || !s->symbol) { p->reason = kNvStageNoMetadata; return ENOMEM; }
++    // One scattered 32 MiB buffer first (its own kernel mapping is contiguous). Only unavailability or too many
++    // physical runs permits the bounded chunk plans; invalid pages are failures, never a silent downgrade.
++    int err = nvStageAllocateChunk(s, p, kNvStageCapacity, false);
++    if (!err && p->rawRuns <= kNvStageRunLimit) return 0;
++    if (err && p->reason != kNvStageNoBuffer) return err;
++    nvStageResetPreparation(s, p);
++    for (UInt32 i = 0; i < kNvStageCapacity / kNvStageLargeChunkBytes && !err; ++i)
++        err = nvStageAllocateChunk(s, p, kNvStageLargeChunkBytes, true);
++    if (err) {
++        if (p->reason != kNvStageNoBuffer) return err;
++        nvStageResetPreparation(s, p);
++        for (UInt32 i = 0; i < kNvStageMaxChunks; ++i) {
++            err = nvStageAllocateChunk(s, p, kNvStageChunkBytes, true);
++            if (err) return err;
++        }
++    }
++    if (p->rawRuns > kNvStageRunLimit) { p->reason = kNvStageTooManyRuns; return EINVAL; }
++    return nvStageMapChunks(s, p);
++}
++static void nvStageStart(NVAccel *a)
++{
++    if (!a || !a->fConsoleCopyLock) return;
++    IOLock *lock = __atomic_load_n(&gNvStageLock, __ATOMIC_ACQUIRE);
++    if (!lock) {
++        IOLock *created = IOLockAlloc();
++        if (!created) return;
++        IOLock *expected = nullptr;
++        if (!__atomic_compare_exchange_n(&gNvStageLock, &expected, created, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
++            IOLockFree(created);
++        lock = __atomic_load_n(&gNvStageLock, __ATOMIC_ACQUIRE);
++    }
++    IOLockLock(lock);
++    if (!gNvStageOwner && !gNvStageClosed) gNvStageOwner = a;
++    IOLockUnlock(lock);
++}
++static void nvStageStop(NVAccel *a)
++{
++    IOLock *lock = __atomic_load_n(&gNvStageLock, __ATOMIC_ACQUIRE);
++    if (!lock) return;
++    IOLockLock(lock);
++    if (gNvStageOwner == a) { gNvStageOwner = nullptr; gNvStageClosed = true; }
++    IOLockUnlock(lock);
++}
++static bool nvStageGeometry(UInt64 sourceBytes, UInt64 bytes, UInt32 w, UInt32 h, UInt32 pitch)
++{
++    return w && h && pitch && !(pitch & 3) && UInt64(pitch) >= UInt64(w) * 4 &&
++           bytes == UInt64(pitch) * h && bytes <= sourceBytes && bytes <= kNvStageCapacity;
++}
++
++struct NvSProviderState {
++    NvStageStorage *storage;
++    UInt64 epoch, lastLease;
++    bool attempted, preparing, ready, closed, inFlight, quarantined;
++    // An ambiguous (failed or timed-out) submission keeps every lifetime it may still reference, forever.
++    NVAccel *quarantineAccelerator;
++    NVVidMemory *quarantineSource;
++    IOService *quarantineRm;
++    NvConsoleSourcePin quarantinePin;
++};
++static NvSProviderState gNvSProvider;
++
++int NvPrepareCompletedS(NVAccel *a)
++{
++    IOLock *lock = __atomic_load_n(&gNvStageLock, __ATOMIC_ACQUIRE);
++    if (!a || !lock) return ENXIO;
++    IOLockLock(lock);
++    if (gNvStageOwner != a || gNvStageClosed || gNvSProvider.closed) { IOLockUnlock(lock); return ENXIO; }
++    if (gNvSProvider.ready) { IOLockUnlock(lock); return 0; }
++    if (gNvSProvider.preparing) { IOLockUnlock(lock); return EBUSY; }
++    if (gNvSProvider.attempted) { IOLockUnlock(lock); return EIO; }
++    gNvSProvider.attempted = true; gNvSProvider.preparing = true;
++    const UInt64 epoch = gNvSProvider.epoch;
++    a->retain();
++    IOLockUnlock(lock);
++
++    NvStagePreparation preparation = {};
++    NvStageStorage *prepared = static_cast<NvStageStorage *>(IOMalloc(sizeof(NvStageStorage)));
++    if (prepared) *prepared = {};
++    int error = prepared ? nvStagePrepare(prepared, &preparation) : ENOMEM;   // no lock held
++
++    IOLockLock(lock);
++    gNvSProvider.preparing = false;
++    if (gNvStageOwner != a || gNvStageClosed || gNvSProvider.closed || epoch != gNvSProvider.epoch) {
++        error = ECANCELED;
++    } else if (!error) {
++        gNvSProvider.storage = prepared; prepared = nullptr;
++        gNvSProvider.ready = true;
++    }
++    IOLockUnlock(lock);
++    if (error) ALOG("Hyper-V completed-frame pool: preparation failed (%d, reason %u) -- console uses CPU copies",
++                    error, preparation.reason);
++    nvStageDispose(prepared);   // nothing was ever submitted to it
++    a->release();
++    return error;
++}
++
++// Terminal for this accelerator: closes admission and drains the copy lock (an admitted consumer included).
++void NvCancelCompletedS(NVAccel *a)
++{
++    IOLock *lock = __atomic_load_n(&gNvStageLock, __ATOMIC_ACQUIRE);
++    if (!a || !lock || !a->fConsoleCopyLock) return;
++    IOLockLock(lock);
++    if (gNvStageOwner != a) { IOLockUnlock(lock); return; }
++    a->retain();
++    gNvSProvider.closed = true; gNvSProvider.ready = false; ++gNvSProvider.epoch;
++    IOLockUnlock(lock);
++    IOLockLock(a->fConsoleCopyLock);   // never wait on the copy lock while holding the stage lock
++    IOLockLock(lock);
++    NvStageStorage *retired = nullptr;
++    if (!gNvSProvider.quarantined) { retired = gNvSProvider.storage; gNvSProvider.storage = nullptr; }
++    IOLockUnlock(lock);
++    IOLockUnlock(a->fConsoleCopyLock);
++    nvStageDispose(retired);
++    a->release();
++}
++
++// Caller owns live accelerator/source/RM references and has satisfied the producer completion requirement (the
++// surface's completion mark, nvSurfWaitReady). Caller must NOT hold the copy, stage or publication locks. Order:
++// stage (released) -> console pin (released) -> copy -> stage (released) -> RM -> consumer. Every outcome is terminal
++// for this frame; the caller never falls into a second writer.
++NvSProviderResult NvProduceCompletedS(NVAccel *a, NVVidMemory *vm, IOService *rm,
++    void *kapiDevice, UInt32 width, UInt32 height, UInt32 pitch,
++    NvSConsumeCompleted consume, void *context)
++{
++    IOLock *lock = __atomic_load_n(&gNvStageLock, __ATOMIC_ACQUIRE);
++    const UInt64 bytes = UInt64(pitch) * height;
++    if (!a || !vm || !rm || !kapiDevice || !consume || !lock || !a->fConsoleCopyLock ||
++        !nvStageGeometry(kNvStageCapacity, bytes, width, height, pitch)) return NvSProviderResult::InvalidSource;
++    IOLockLock(lock);
++    if (gNvStageOwner != a || gNvStageClosed || gNvSProvider.closed) { IOLockUnlock(lock); return NvSProviderResult::Cancelled; }
++    if (!gNvSProvider.ready) { IOLockUnlock(lock); return NvSProviderResult::NotReady; }
++    a->retain();
++    IOLockUnlock(lock);
++    vm->retain(); rm->retain();
++    NvConsoleSourcePin sourcePin = {};
++    if (!a->consolePinSource(vm, kapiDevice, bytes, &sourcePin)) {
++        rm->release(); vm->release(); a->release();
++        return NvSProviderResult::InvalidSource;
++    }
++    IOLockLock(a->fConsoleCopyLock);
++    IOLockLock(lock);
++    NvSProviderResult refused = NvSProviderResult::PixelsEstablished;
++    if (gNvStageOwner != a || gNvStageClosed || gNvSProvider.closed || !gNvSProvider.ready || !gNvSProvider.storage)
++        refused = NvSProviderResult::Cancelled;
++    else if (gNvSProvider.lastLease == ~UInt64(0)) refused = NvSProviderResult::LeaseExhausted;
++    else if (a->fConsoleDmaDisabled) refused = NvSProviderResult::InvalidSource;
++    if (refused != NvSProviderResult::PixelsEstablished) {
++        IOLockUnlock(lock); IOLockUnlock(a->fConsoleCopyLock);
++        a->consoleUnpinSource(&sourcePin);
++        rm->release(); vm->release(); a->release();
++        return refused;
++    }
++    const UInt64 epoch = gNvSProvider.epoch;
++    const NvStageStorage *storage = gNvSProvider.storage;
++    gNvSProvider.inFlight = true;
++    IOLockUnlock(lock);
++    NVRMSurfPageoff request = {};
++    request.version = NVRM_SS_RM_VERSION; request.status = NVRM_SS_OFF;
++    request.kapiDevice = sourcePin.device; request.kapiMemory = sourcePin.memory.handle;
++    request.pages = storage->pages; request.pageCount = (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
++    request.length = bytes;
++    const IOReturn io = rm->callPlatformFunction(storage->symbol, false, &request, nullptr, nullptr, nullptr);
++    if (io != kIOReturnSuccess || request.status) {
++        a->fConsoleDmaDisabled = true;
++        OSAddAtomic64(1, &gCntConsoleDmaRefused);
++        IOLockLock(lock);
++        gNvSProvider.quarantined = true; gNvSProvider.ready = false;
++        gNvSProvider.closed = true; gNvSProvider.inFlight = false;
++        gNvSProvider.quarantineAccelerator = a;
++        gNvSProvider.quarantineSource = vm; gNvSProvider.quarantineRm = rm;
++        gNvSProvider.quarantinePin = sourcePin;
++        IOLockUnlock(lock);
++        IOLockUnlock(a->fConsoleCopyLock);
++        ALOG("Hyper-V completed-frame copy failed: IOReturn 0x%x status 0x%x -- pool and source quarantined, CPU copies "
++             "from now on", (unsigned)io, request.status);
++        // The source allocation stays pinned and every reference above is kept: the engine may still write S.
++        return NvSProviderResult::DmaFailure;
++    }
++    IOLockLock(lock);
++    const bool admitted = gNvStageOwner == a && !gNvStageClosed && !gNvSProvider.closed && epoch == gNvSProvider.epoch;
++    const UInt64 identity = admitted ? ++gNvSProvider.lastLease : 0;
++    IOLockUnlock(lock);
++    NvSProviderResult result = NvSProviderResult::StaleRejected;
++    if (admitted) {
++        NvSCompletedView view = {};
++        view.cpuAddress = storage->aliasWords ? storage->aliasWords : storage->chunks[0].words;
++        view.validLength = bytes; view.width = width; view.height = height; view.pitch = pitch;
++        view.leaseIdentity = identity; view.sourceIdentity = sourcePin.memory.allocationCookie;
++        view.sourceRmHandle = sourcePin.memory.handle;
++        view.descriptor = storage->aliasDescriptor ? storage->aliasDescriptor : storage->chunks[0].buffer;
++        view.mapping = storage->aliasMap; view.backing = storage;
++        switch (consume(context, &view)) {
++            case NvSConsumerResult::PixelsEstablished: result = NvSProviderResult::PixelsEstablished; break;
++            case NvSConsumerResult::StaleRejected: result = NvSProviderResult::StaleRejected; break;
++            default: result = NvSProviderResult::ConsumerFailure; break;
++        }
++    }
++    IOLockLock(lock); gNvSProvider.inFlight = false; IOLockUnlock(lock);
++    IOLockUnlock(a->fConsoleCopyLock);
++    a->consoleUnpinSource(&sourcePin);   // after the copy lock
++    rm->release(); vm->release(); a->release();
++    return result;
++}
++
++// Publication consumer: hands the completed view to the framebuffer's commit. No raw aperture address in this ABI.
++struct NvPublicationContext {
++    IOService *framebuffer;
++    HPReply captured, reply;
++};
++static NvSConsumerResult nvPublicationConsume(void *opaque, const NvSCompletedView *view)
++{
++    auto *c = static_cast<NvPublicationContext *>(opaque);
++    if (!c || !view || !view->cpuAddress || !view->leaseIdentity || !view->sourceIdentity ||
++        view->width != c->captured.geometry.width || view->height != c->captured.geometry.height)
++        return NvSConsumerResult::StaleRejected;
++    HPCommit q = {};
++    q.header = {sizeof(q), HP_ABI_VERSION};
++    q.ticket = c->captured.ticket;
++    q.serial = view->leaseIdentity;
++    q.geometry = c->captured.geometry;
++    q.source = {reinterpret_cast<uint64_t>(view->cpuAddress), view->validLength, view->pitch,
++                view->leaseIdentity, view->sourceIdentity, HP_LEASE_COMPLETED_CACHED_IMMUTABLE, 0};
++    const IOReturn status = c->framebuffer->callPlatformFunction(gNvPublicationCommitSymbol, false, &q,
++        reinterpret_cast<void *>(sizeof(q)), &c->reply, reinterpret_cast<void *>(sizeof(c->reply)));
++    if (status != kIOReturnSuccess || c->reply.header.bytes != sizeof(c->reply) || c->reply.header.version != HP_ABI_VERSION)
++        return status == kIOReturnNotReady || status == kIOReturnNotAttached ?
++            NvSConsumerResult::StaleRejected : NvSConsumerResult::ConsumerFailure;
++    if (c->reply.flags & HP_REPLY_PIXELS_ESTABLISHED) return NvSConsumerResult::PixelsEstablished;
++    if (c->reply.status == HPStatus::CoreRejected && (c->reply.coreStatus == PC_STALE ||
++        c->reply.coreStatus == PC_NOT_READY || c->reply.coreStatus == PC_OLD_SERIAL || c->reply.coreStatus == PC_STOPPED))
++        return NvSConsumerResult::StaleRejected;
++    return NvSConsumerResult::ConsumerFailure;
++}
++static IOReturn nvPublicationProduce(NVAccel *a, IOService *fb, NVVidMemory *vm, unsigned w, unsigned h, unsigned pitch)
++{
++    if (!a || !fb || !vm || !w || !h || pitch < uint64_t(w) * 4 || (pitch & 3) || !gNvPublicationCommitSymbol)
++        return kIOReturnBadArgument;
++    NvPublicationContext context = {};
++    context.framebuffer = fb;
++    fb->retain(); vm->retain();
++    if (!nvPublicationDescribe(fb, &context.captured) || context.captured.geometry.width != w ||
++        context.captured.geometry.height != h) {
++        vm->release(); fb->release();
++        OSAddAtomic64(1, &gCntPublicationStale);
++        return kIOReturnNotReady;
++    }
++    NVRMRmHandles handles = {};
++    IOService *rm = nvAccelNVRM();
++    if (!rm || !nvAccelRmHandles(&handles)) { vm->release(); fb->release(); return kIOReturnNotReady; }
++    rm->retain();
++    const NvSProviderResult result = NvProduceCompletedS(a, vm, rm, handles.kapiDevice, w, h, pitch,
++                                                         nvPublicationConsume, &context);
++    rm->release(); vm->release(); fb->release();
++    if (result == NvSProviderResult::PixelsEstablished) {
++        OSAddAtomic64(1, &gCntConsoleDirect);
++        return kIOReturnSuccess;   // notification debt is the framebuffer's, never a second copy
++    }
++    if (result == NvSProviderResult::StaleRejected || result == NvSProviderResult::Cancelled ||
++        result == NvSProviderResult::NotReady) { OSAddAtomic64(1, &gCntPublicationStale); return kIOReturnNotReady; }
++    OSAddAtomic64(1, &gCntConsoleDirectRefused);
++    if (result == NvSProviderResult::DmaFailure || result == NvSProviderResult::ConsumerFailure) gConsoleDirectFailed = true;
++    return kIOReturnIOError;
++}
++// CPU fallback for the private console: the publisher snapshots the CPU source into its own S synchronously.
++static IOReturn nvPublicationCPU(IOService *fb, const void *source, uint64_t bytes, unsigned w, unsigned h, unsigned pitch)
++{
++    if (!fb || !source || !w || !h || pitch < uint64_t(w) * 4 || uint64_t(pitch) * h > bytes || !gNvPublicationCPUSymbol)
++        return kIOReturnBadArgument;
++    fb->retain();
++    HPReply captured = {}, reply = {};
++    if (!nvPublicationDescribe(fb, &captured)) { fb->release(); return kIOReturnNotReady; }
++    HPCPUFrame q = {};
++    q.header = {sizeof(q), HP_ABI_VERSION}; q.expected = captured.ticket;
++    q.cpuAddress = reinterpret_cast<uint64_t>(source); q.validLength = bytes; q.pitch = pitch; q.width = w; q.height = h;
++    const IOReturn result = fb->callPlatformFunction(gNvPublicationCPUSymbol, false, &q, reinterpret_cast<void *>(sizeof(q)),
++                                                     &reply, reinterpret_cast<void *>(sizeof(reply)));
++    fb->release();
++    if (result != kIOReturnSuccess) return result;
++    return (reply.flags & HP_REPLY_PIXELS_ESTABLISHED) ? kIOReturnSuccess : kIOReturnNotReady;
++}
++
++// Older (non-private) console: the copy engine writes the frame straight into the Hyper-V aperture, then Present.
++// The source allocation is pinned for the copy; a failed or timed-out copy keeps the pin forever and turns this path
++// off for the boot (the engine may still be writing).
++static bool nvConsoleDirectPresent(NVAccel *a, IOService *fb, NVVidMemory *vm, unsigned w, unsigned h, unsigned pitch)
++{
++    if (!a || !fb || fb != a->fFB || !nvConsoleFramebuffer(fb) || nvPrivatePublication(fb)) return false;
++    if (!gConsoleDirectMode || gConsoleDirectFailed || a->fConsoleDmaDisabled || !a->fConsoleCopyLock ||
++        !vm || !vm->fRmHandle || vm->fScanout || !w || !h || pitch < 4ull * w || (pitch & 3)) return false;
++    NVRMVramRequest q = {}; q.version = NVRM_VRAM_ABI_VERSION;
++    const UInt64 bytes = static_cast<UInt64>(pitch) * h;
++    if (bytes > vm->fBytes || bytes > kNvConsoleMaxFrameBytes ||
++        a->askFramebufferForScanout(&q, fb) != kIOReturnSuccess ||
++        q.width != w || q.height != h || q.pitch != pitch || q.actualSize < bytes ||
++        !q.kva || !q.phys || (q.phys & (PAGE_SIZE - 1))) return false;
++    NVRMRmHandles handles = {};
++    IOService *rm = nvAccelNVRM();
++    if (!rm || !nvAccelRmHandles(&handles)) return false;
++    const OSSymbol *symbol = OSSymbol::withCStringNoCopy(NVRM_SS_FN_PAGEOFF);
++    if (!symbol) return false;
++    NvConsoleSourcePin pin = {};
++    if (!a->consolePinSource(vm, handles.kapiDevice, bytes, &pin)) { symbol->release(); return false; }
++    IOLockLock(a->fConsoleCopyLock);
++    const UInt64 pages = (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
++    bool ok = !gConsoleDirectFailed;
++    if (ok && a->fConsoleDirectPageCapacity < pages) {
++        unsigned long long *list = static_cast<unsigned long long *>(IOMalloc(pages * sizeof(*list)));
++        if (!list) ok = false;
++        else {
++            if (a->fConsoleDirectPages) IOFree(a->fConsoleDirectPages, a->fConsoleDirectPageCapacity * sizeof(*list));
++            a->fConsoleDirectPages = list; a->fConsoleDirectPageCapacity = pages; a->fConsoleDirectBase = 0;
++        }
++    }
++    if (!ok) {
++        IOLockUnlock(a->fConsoleCopyLock);
++        a->consoleUnpinSource(&pin);
++        symbol->release();
++        return false;
++    }
++    if (a->fConsoleDirectBase != q.phys) {
++        for (UInt64 i = 0; i < a->fConsoleDirectPageCapacity; ++i) a->fConsoleDirectPages[i] = q.phys + i * PAGE_SIZE;
++        a->fConsoleDirectBase = q.phys;
++    }
++    NVRMSurfPageoff request = {};
++    request.version = NVRM_SS_RM_VERSION; request.status = NVRM_SS_OFF;
++    request.kapiDevice = pin.device; request.kapiMemory = pin.memory.handle;
++    request.pages = a->fConsoleDirectPages; request.pageCount = pages; request.length = bytes;
++    const IOReturn result = rm->callPlatformFunction(symbol, false, &request, nullptr, nullptr, nullptr);
++    symbol->release();
++    ok = result == kIOReturnSuccess && request.status == 0;
++    if (ok) OSAddAtomic64(1, &gCntConsoleDirect);
++    else {
++        gConsoleDirectFailed = true;
++        a->fConsoleDmaDisabled = true;
++        OSAddAtomic64(1, &gCntConsoleDirectRefused); OSAddAtomic64(1, &gCntConsoleDmaRefused);
++        ALOG("direct console DMA failed: IOReturn 0x%x status 0x%x -- CPU copies for this boot", (unsigned)result, request.status);
++    }
++    IOLockUnlock(a->fConsoleCopyLock);
++    if (!ok) return false;   // the pin (and the page list the engine may still use) is deliberately kept
++    a->consoleUnpinSource(&pin);
++    nvConsolePresent(fb, w, h);
++    return true;
++}
++// END HYPERV-CARRY
++
+ #define NVSCANOUT_COPY_MAX 120
+ static unsigned nvScanoutCopies = 0;
+ static bool nvAccelCopyToScanout(IOAccelResource2 *res)
+@@ -2150,6 +3339,17 @@ static bool nvAccelFlipTo(IOAccelResource2 *res)
+ 
+ IOReturn NVAccel::callPlatformFunction(const OSSymbol *fn, bool wait, void *p1, void *p2, void *p3, void *p4)
+ {
++#ifndef NMX_ACCEL
++    // HYPERV-CARRY: MacHyperVSupport's framebuffer registers itself once its scanout exists (it may publish before
++    // this accelerator watches, or before its geometry is committed). Only the console under this GPU is accepted.
++    if (fn && p1 && fn->isEqualTo("nvRegisterConsoleFramebuffer")) {
++        IOService *fb = OSDynamicCast(IOService, static_cast<OSObject *>(p1));
++        if (!fb || !fPCI || fb->getProvider() != fPCI || !nvConsoleFramebuffer(fb) || !fConsoleLock || !fConsoleCopyLock)
++            return kIOReturnNotPermitted;
++        fbPublished(this, nullptr, fb, nullptr);
++        return (gNvHeadsPiped & 1u) ? kIOReturnSuccess : kIOReturnNotReady;
++    }
++#endif
+     if (fn && p1 && fn->isEqualTo(NVACCEL_SS_FN))
+         return nvAccelSurfVram((struct NVRMSurfShareEsc *)p1, (task_t)p2, (unsigned)(uintptr_t)p3);
+     return IOService::callPlatformFunction(fn, wait, p1, p2, p3, p4);
+diff --git a/kexts/NVRM/accel/re/IOAccelDevice2.h b/kexts/NVRM/accel/re/IOAccelDevice2.h
+index 5e692b5..3208887 100644
+--- a/kexts/NVRM/accel/re/IOAccelDevice2.h
++++ b/kexts/NVRM/accel/re/IOAccelDevice2.h
+@@ -146,7 +146,7 @@ private:
+      * sizeof(IOUserClient) so this stays correct across OS revisions where the
+      * base class changes but 0x188 does not.
+      */
+-    uint8_t _opaque[kIOAccelDevice2Size - sizeof(IOUserClient)];
++    alignas(void *) uint8_t _opaque[kIOAccelDevice2Size - sizeof(IOUserClient)];
+ };
+ 
+ static_assert(sizeof(IOAccelDevice2) == kIOAccelDevice2Size,
+diff --git a/kexts/NVRM/accel/re/IOAccelSharedUserClient2.h b/kexts/NVRM/accel/re/IOAccelSharedUserClient2.h
+index 7df3909..9052cfa 100644
+--- a/kexts/NVRM/accel/re/IOAccelSharedUserClient2.h
++++ b/kexts/NVRM/accel/re/IOAccelSharedUserClient2.h
+@@ -152,7 +152,7 @@ public:
+ 
+ private:
+     /* Layout not recovered; total extent fixed by the metaclass size. */
+-    uint8_t _opaque[kIOAccelSharedUserClient2Size - sizeof(IOUserClient)];
++    alignas(void *) uint8_t _opaque[kIOAccelSharedUserClient2Size - sizeof(IOUserClient)];
+ };
+ 
+ static_assert(sizeof(IOAccelSharedUserClient2) == kIOAccelSharedUserClient2Size,
+diff --git a/kexts/NVRM/accel/re/IOAccelerator.h b/kexts/NVRM/accel/re/IOAccelerator.h
+index 963e3a2..42ca3db 100644
+--- a/kexts/NVRM/accel/re/IOAccelerator.h
++++ b/kexts/NVRM/accel/re/IOAccelerator.h
+@@ -75,7 +75,7 @@ private:
+      * compiler supplies sizeof(IOService) so this stays correct even if the
+      * base changes between SDKs, and the static_assert catches it if not.
+      */
+-    uint8_t _opaque[kIOAcceleratorSize - sizeof(IOService)];
++    alignas(void *) uint8_t _opaque[kIOAcceleratorSize - sizeof(IOService)];
+ };
+ 
+ static_assert(sizeof(IOAccelerator) == kIOAcceleratorSize,
+diff --git a/kexts/NVRM/accel/re/IOGraphicsAccelerator2.h b/kexts/NVRM/accel/re/IOGraphicsAccelerator2.h
+index 09597fb..53553d0 100644
+--- a/kexts/NVRM/accel/re/IOGraphicsAccelerator2.h
++++ b/kexts/NVRM/accel/re/IOGraphicsAccelerator2.h
+@@ -189,7 +189,7 @@ public:
+ 
+ private:
+     /* Layout not recovered; extent fixed by the registry size. */
+-    uint8_t _opaque[kIOGraphicsAccelerator2Size - sizeof(IOAccelerator)];
++    alignas(void *) uint8_t _opaque[kIOGraphicsAccelerator2Size - sizeof(IOAccelerator)];
+ };
+ 
+ static_assert(sizeof(IOGraphicsAccelerator2) == kIOGraphicsAccelerator2Size,
+diff --git a/kexts/NVRMAGDC/Info.plist b/kexts/NVRMAGDC/Info.plist
+index 0415546..d70073a 100644
+--- a/kexts/NVRMAGDC/Info.plist
++++ b/kexts/NVRMAGDC/Info.plist
+@@ -5,8 +5,8 @@
+   <key>CFBundleName</key><string>NVRMAGDC</string>
+   <key>CFBundleExecutable</key><string>NVRMAGDC</string>
+   <key>CFBundlePackageType</key><string>KEXT</string>
+-  <key>CFBundleVersion</key><string>0.1</string>
+-  <key>CFBundleShortVersionString</key><string>0.1</string>
++  <key>CFBundleVersion</key><string>2.3.1d1</string>
++  <key>CFBundleShortVersionString</key><string>2.3.1-hv1</string>
+   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+   <key>IOKitPersonalities</key><dict>
+     <key>NVDAGDCLoader</key><dict>
+diff --git a/kexts/NVRMAGDC/nvrm-agdc.cpp b/kexts/NVRMAGDC/nvrm-agdc.cpp
+index fe514be..157f141 100644
+--- a/kexts/NVRMAGDC/nvrm-agdc.cpp
++++ b/kexts/NVRMAGDC/nvrm-agdc.cpp
+@@ -14,7 +14,7 @@
+ #define FBLOG(fmt, ...) IOLog("NVRM-agdc: " fmt "\n", ##__VA_ARGS__)
+ #include <mach/kmod.h>
+ extern "C" kern_return_t _start(kmod_info_t *ki, void *d); extern "C" kern_return_t _stop(kmod_info_t *ki, void *d);
+-extern "C" { KMOD_EXPLICIT_DECL(com.nullmoth.NVRMAGDC, "0.1", _start, _stop) }
++extern "C" { KMOD_EXPLICIT_DECL(com.nullmoth.NVRMAGDC, "2.3.1d1", _start, _stop) }   // HYPERV-CARRY: 2.3.1-hv1
+ extern "C" kern_return_t _start(kmod_info_t *ki, void *d) { return KERN_SUCCESS; }
+ extern "C" kern_return_t _stop(kmod_info_t *ki, void *d)  { return KERN_SUCCESS; }
+ #include "AppleGraphicsDeviceControl_re.h"
+@@ -69,6 +69,23 @@ public:
+ };
+ OSDefineMetaClassAndStructors(NVDADeviceControl, AppleGraphicsDeviceControl)
+ 
++// HYPERV-CARRY: besides NVRMFB's heads, answer for MacHyperVSupport's console framebuffer (HyperVGraphicsFramebuffer and
++// its HyperVNVDAGraphicsFramebuffer subclass) when it sits on the negotiated Hyper-V RTX 4060 (10de:28a0) endpoint.
++static bool nvdaSupportedFramebuffer(IOService *fb)
++{
++    if (!fb) return false;
++    if (fb->metaCast("NVRMNVDAFramebuffer")) return true;
++    if (!fb->metaCast("HyperVGraphicsFramebuffer")) return false;
++    IOService *gpu = fb->getProvider();
++    if (!gpu || fb->getProperty("HyperVConsoleTransport") != kOSBooleanTrue ||
++        gpu->getProperty("HyperVPCIUsesNegotiatedResources") != kOSBooleanTrue) return false;
++    OSData *vendor = OSDynamicCast(OSData, gpu->getProperty("vendor-id"));
++    OSData *device = OSDynamicCast(OSData, gpu->getProperty("device-id"));
++    return vendor && device && vendor->getLength() == 4 && device->getLength() == 4 &&
++        *(const UInt32 *)vendor->getBytesNoCopy() == 0x10de &&
++        *(const UInt32 *)device->getBytesNoCopy() == 0x28a0;
++}
++
+ static IOReturn nvdaK5Answer(IOService *fb, unsigned int cmd, unsigned long *in, unsigned long inSize, unsigned long *out, unsigned long *outSize)
+ {
+     IOService *slot[kAgdcMaxFB]; unsigned nh = gAgdcNFB;
+@@ -79,6 +96,11 @@ static IOReturn nvdaK5Answer(IOService *fb, unsigned int cmd, unsigned long *in,
+         OSObject *o = slot[i] ? slot[i]->copyProperty("NVRMTiming") : NULL; OSData *d = OSDynamicCast(OSData, o);
+         if (d) { have = true; tBytes = d->getLength(); bzero(t[i], sizeof t[i]); if (tBytes == sizeof t[i]) memcpy(t[i], d->getBytesNoCopy(), sizeof t[i]); }
+         OSSafeReleaseNULL(o);
++        if (!have && slot[i] && slot[i]->getProperty("HyperVConsoleTransport") == kOSBooleanTrue) {
++            IOReturn result = slot[i]->callPlatformFunction("HyperVConsoleAgdcTiming", false,
++                t[i], (void *)(uintptr_t)sizeof t[i], nullptr, nullptr);
++            if (result == kIOReturnSuccess) { have = true; tBytes = sizeof t[i]; }
++        }
+         h[i].t = have ? t[i] : NULL; h[i].tBytes = tBytes;
+     }
+     int why = 0; int32_t idx = -1;
+@@ -166,8 +188,14 @@ static void nvdaAgdcDropFB(void) { if (gAgdcFBRef) { gAgdcFBRef->release(); gAgd
+ static void nvdaAgdcTargets(IOService **pci, IOService **fb)
+ {
+     *pci = nullptr; *fb = nullptr;
+-    OSDictionary *m = IOService::serviceMatching("NVRMNVDAFramebuffer"); if (!m) return;
+-    IOService *f = IOService::copyMatchingService(m); m->release(); if (!f) return;
++    OSDictionary *m = IOService::serviceMatching("IOFramebuffer"); if (!m) return;
++    OSIterator *it = IOService::getMatchingServices(m); m->release(); if (!it) return;
++    IOService *f = nullptr;
++    while (OSObject *object = it->getNextObject()) {
++        IOService *candidate = OSDynamicCast(IOService, object);
++        if (nvdaSupportedFramebuffer(candidate)) { f = candidate; f->retain(); break; }
++    }
++    it->release(); if (!f) return;
+     IOService *p = f->getProvider(); int hops = 0;
+     while (p && !p->metaCast("IOPCIDevice") && hops++ < 8) p = p->getProvider();
+     if (!p || !p->metaCast("IOPCIDevice")) { f->release(); return; }
+@@ -180,19 +208,21 @@ static void nvdaAgdcScan(IOService *pci)
+ {
+     nvdaAgdcDropTable(); gAgdcScanLogged = 0;
+     IOService *tab[kAgdcMaxFB] = {}; unsigned seen = 0, noidx = 0, range = 0, dup = 0, other = 0, hole = 0;
+-    OSDictionary *m = IOService::serviceMatching("NVRMNVDAFramebuffer");
++    OSDictionary *m = IOService::serviceMatching("IOFramebuffer");
+     OSIterator *it = m ? IOService::getMatchingServices(m) : nullptr; OSSafeReleaseNULL(m);
+     if (!it) { snprintf(gAgdcFBMap, sizeof gAgdcFBMap, "n=0 (no iterator: the earlier one-head reply)"); FBLOG("AGDC: slot table %s", gAgdcFBMap); return; }
+     OSObject *o;
+     while (seen < 16 && (o = it->getNextObject())) {
+         seen++;
+         IOService *f = OSDynamicCast(IOService, o); if (!f) continue;
++        if (!nvdaSupportedFramebuffer(f)) continue;
+         unsigned long long rid = f->getRegistryEntryID();
+         IOService *p = f->getProvider(); int hops = 0;
+         while (p && !p->metaCast("IOPCIDevice") && hops++ < 8) p = p->getProvider();
+         if (p != pci) { other++; SCANLOG("framebuffer id %#llx is under another PCI device: not ours to report", rid); continue; }
+         OSObject *io = f->copyProperty("IOFBDependentIndex"); OSNumber *num = OSDynamicCast(OSNumber, io);
+-        long long ix = num ? (long long)num->unsigned32BitValue() : -1; OSSafeReleaseNULL(io);
++        long long ix = num ? (long long)num->unsigned32BitValue() :
++            (f->getProperty("HyperVConsoleTransport") == kOSBooleanTrue ? 0 : -1); OSSafeReleaseNULL(io);
+         if (ix < 0) { noidx++; SCANLOG("framebuffer id %#llx has no IOFBDependentIndex number: left out", rid); continue; }
+         if (ix >= kAgdcMaxFB) { range++; SCANLOG("framebuffer id %#llx IOFBDependentIndex %lld >= %d: left out", rid, ix, (int)kAgdcMaxFB); continue; }
+         if (tab[ix]) { dup++; SCANLOG("IOFBDependentIndex %lld claimed twice: id %#llx kept, id %#llx left out", ix, (unsigned long long)tab[ix]->getRegistryEntryID(), rid); continue; }

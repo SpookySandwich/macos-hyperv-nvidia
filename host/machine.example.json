@@ -1,0 +1,15 @@
+{
+  "_comment": "Copy to machine.json (git-ignored) and replace every value with your own. Find them with: Get-VM | Select Name,Id; Get-PnpDevice -Class Display | Select FriendlyName,InstanceId; (Get-PnpDeviceProperty -InstanceId <id> -KeyName DEVPKEY_Device_LocationPaths).Data",
+  "VmName": "macOS-HyperV",
+  "VmId": "00000000-0000-0000-0000-000000000000",
+  "VmDirectory": "",
+  "GpuInstanceId": "PCI\\VEN_10DE&DEV_28A0&SUBSYS_00000000&REV_A1\\0&00000000&0&0000",
+  "GpuLocationPath": "PCIROOT(0)#PCI(0000)#PCI(0000)",
+  "GpuFriendlyName": "NVIDIA GeForce RTX 4060 Laptop GPU",
+  "HostDisplayAdapter": "Intel(R) Arc(TM) Graphics",
+  "VirtualSwitch": "Default Switch",
+  "GuestMac": "00-15-5D-00-00-00",
+  "GuestUser": "<guest-user>",
+  "SshKey": "~/.ssh/id_macos_hyperv",
+  "WindowsBootEntry": "{default}"
+}

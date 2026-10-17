@@ -1,0 +1,35 @@
+<Window x:Class="MacOS.App.MainWindow" xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Title="macOS">
+  <Grid x:Name="Root" Background="{ThemeResource ApplicationPageBackgroundThemeBrush}" AutomationProperties.AutomationId="MacOSWindow">
+    <Grid.RowDefinitions><RowDefinition Height="48"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+    <TitleBar x:Name="CaptionBar" Title="macOS">
+      <TitleBar.IconSource><FontIconSource Glyph="&#xE7F4;"/></TitleBar.IconSource>
+      <TitleBar.RightHeader>
+      <Button x:Name="MenuButton" AutomationProperties.Name="Session options" AutomationProperties.AutomationId="SessionMenu" Style="{StaticResource SubtleButtonStyle}">
+        <FontIcon Glyph="&#xE712;" FontSize="16"/>
+        <Button.Flyout><MenuFlyout>
+          <MenuFlyoutSubItem Text="Guest resolution">
+            <MenuFlyoutItem Text="1280 × 720 · 60 Hz" Tag="720" Click="ResolutionClick" AutomationProperties.AutomationId="Resolution720"/>
+            <MenuFlyoutItem Text="1920 × 1080 · 60 Hz" Tag="1080" Click="ResolutionClick" AutomationProperties.AutomationId="Resolution1080"/>
+          </MenuFlyoutSubItem>
+          <MenuFlyoutSeparator/><MenuFlyoutItem Text="Shut down macOS" Click="ShutdownClick"/>
+          <MenuFlyoutSeparator/><MenuFlyoutItem Text="Open diagnostics" Click="DiagnosticsClick"/>
+        </MenuFlyout></Button.Flyout>
+      </Button>
+      </TitleBar.RightHeader>
+    </TitleBar>
+    <Grid Grid.Row="1" x:Name="Viewport" AutomationProperties.AutomationId="MacOSDisplay">
+      <ScrollViewer x:Name="LoadingPanel" HorizontalScrollBarVisibility="Disabled" HorizontalScrollMode="Disabled" VerticalScrollBarVisibility="Auto" VerticalScrollMode="Auto" ZoomMode="Disabled" AutomationProperties.AutomationId="SessionLoading">
+      <Grid MinHeight="{Binding ViewportHeight, ElementName=LoadingPanel}">
+      <StackPanel x:Name="LoadingContent" HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="16" MaxWidth="420" Margin="28">
+        <FontIcon x:Name="LoadingIcon" Glyph="&#xE7F4;" FontSize="48" Foreground="{ThemeResource AccentTextFillColorPrimaryBrush}"/>
+        <TextBlock x:Name="LoadingTitle" Text="macOS" FontSize="28" FontWeight="SemiBold" HorizontalAlignment="Center"/>
+        <ProgressRing x:Name="Progress" IsActive="True" Width="28" Height="28"/>
+        <TextBlock x:Name="StatusText" Text="Connecting…" TextWrapping="Wrap" TextAlignment="Center" AutomationProperties.AutomationId="SessionStatus"/>
+        <Button x:Name="RetryButton" Content="Try again" HorizontalAlignment="Center" Visibility="Collapsed" Click="RetryClick" AutomationProperties.AutomationId="Retry"/>
+      </StackPanel>
+      </Grid>
+      </ScrollViewer>
+    </Grid>
+    <InfoBar Grid.Row="2" x:Name="Notice" IsOpen="False" IsClosable="True" Severity="Warning" AutomationProperties.AutomationId="SessionNotice"/>
+  </Grid>
+</Window>

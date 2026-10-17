@@ -1,0 +1,44 @@
+Third-party code and licenses
+=============================
+
+patches/nvidia-macos-driver/hyperv-kexts.patch
+patches/nvidia-macos-driver/metal-plugin-fixes.patch
+    Modifications of NullMoth's NVIDIA driver for macOS,
+    https://github.com/nullmoth/nvidia-macos-driver, tag v2.3.1 (commit 418051b).
+    The upstream kexts and Metal plugin are licensed under the PolyForm
+    Noncommercial License 1.0.0. These patches are derivative works of that
+    code and are distributed under the same license, for noncommercial
+    purposes only. They are not relicensed by this repository's MIT license.
+    License text: licenses/PolyForm-Noncommercial-1.0.0.txt
+    (https://polyformproject.org/licenses/noncommercial/1.0.0)
+
+    Required Notice: Copyright (c) 2026 NullMoth Systems (https://nullmothsystems.com)
+
+    The kernel patch builds against NVIDIA's open GPU kernel modules
+    (MIT/GPL-2.0, https://github.com/NVIDIA/open-gpu-kernel-modules); no NVIDIA
+    source is included here. No NVIDIA release binaries or firmware are included.
+
+patches/macHyperVSupport.patch
+    Modifications of MacHyperVSupport, https://github.com/acidanthera/MacHyperVSupport,
+    commit cafcd34. Copyright (c) 2021-2025, Goldfish64. BSD-3-Clause.
+    The patch, including the new files it adds (publication/, the framebuffer
+    additions), is distributed under the same BSD-3-Clause license.
+    License text: licenses/MacHyperVSupport-BSD-3-Clause.txt
+
+guest/machypervsupport/build-*.py, guest/headless-metal/
+    Our own code (MIT). They build against acidanthera's MacKernelSDK and Lilu,
+    which are not included.
+
+app/
+    Our own code (MIT). Uses NAudio (MIT) as a NuGet package; the
+    virtual-desktop interop was checked against MScholtes/VirtualDesktop (MIT).
+    See app/src/MacOS.App/THIRD-PARTY-NOTICES.txt.
+
+Not included
+    No Apple software, no OpenCore EFI binaries, no disk images, no NVIDIA
+    binaries or firmware, and no copies of upstream source trees.
+
+Trademarks
+    macOS is a trademark of Apple Inc. NVIDIA and GeForce are trademarks of
+    NVIDIA Corporation. Hyper-V and Windows are trademarks of Microsoft
+    Corporation. This project is not affiliated with or endorsed by them.
